@@ -69,12 +69,12 @@ class InputBlock(nn.Module):
         # Treat channels as tokens and history as the token feature vector.
         tokens = self.channel_embedding(x.transpose(1, 2))
         attended, _ = self.channel_attention(tokens, tokens, tokens, need_weights=False)
-        teacher_tokens = self.teacher_norm(tokens + attended)
+        teacher_tokens = self.teacher_norm(attended)
 
         dictionary = self.dictionary().to(dtype=teacher_tokens.dtype, device=teacher_tokens.device)
         dictionary = dictionary.unsqueeze(0).expand(teacher_tokens.size(0), -1, -1)
         student_tokens, _ = self.cross_attention(teacher_tokens, dictionary, dictionary, need_weights=False)
-        student_tokens = self.student_norm(teacher_tokens + student_tokens)
+        student_tokens = self.student_norm(student_tokens)
         return teacher_tokens, student_tokens
 
 
@@ -118,12 +118,7 @@ class AdaptiveSpectralBlock(nn.Module):
         spectrum = torch.einsum("bcf,fk->bck", spectrum, self.dsp_projection.to(spectrum.dtype))
 
         power = spectrum.abs().pow(2)
-        cutoff = power.detach().mean(dim=-1, keepdim=True) + self.threshold.sigmoid() * power.detach().std(
-            dim=-1,
-            keepdim=True,
-            unbiased=False,
-        )
-        mask = (power >= cutoff).to(spectrum.dtype)
+        mask = (power > self.threshold).to(spectrum.dtype)
 
         global_weight = torch.complex(self.global_real, self.global_imag)
         local_weight = torch.complex(self.local_real, self.local_imag)
@@ -139,7 +134,7 @@ class TrendPeriodicFusion(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
         self.gate = nn.Sequential(
-            nn.Linear(3, d_model),
+            nn.Linear(2, d_model),
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
@@ -152,9 +147,8 @@ class TrendPeriodicFusion(nn.Module):
             device=trend.device,
         )
         trend_summary = trend.mean(dim=-1, keepdim=True)
-        periodic_summary = periodic.mean(dim=-1, keepdim=True)
-        alpha = torch.sigmoid(self.gate(torch.cat([trend_summary, periodic_summary, horizon], dim=-1)))
-        return alpha * trend + (1.0 - alpha) * periodic
+        gate = torch.sigmoid(self.gate(torch.cat([trend_summary, horizon], dim=-1)))
+        return gate * periodic + (1.0 - gate) * trend
 
 
 class ForecastHead(nn.Module):

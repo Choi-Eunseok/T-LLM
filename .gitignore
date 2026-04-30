@@ -10,3 +10,5 @@ data/
 results/
 .hf-cache/
 .codex
+*.pdf
+*.txt
