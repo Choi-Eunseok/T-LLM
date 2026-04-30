@@ -9,3 +9,4 @@ checkpoints/
 data/
 results/
 .hf-cache/
+.codex
