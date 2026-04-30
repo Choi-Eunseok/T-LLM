@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import random
 import shutil
 import urllib.request
@@ -94,6 +95,21 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Use the first fraction of ETTh1 training windows. Set 0.1 for the paper's few-shot protocol.",
     )
+    parser.add_argument(
+        "--train-sampling",
+        choices=["first", "uniform", "random"],
+        default="first",
+        help="How to select windows when --train-fraction < 1. first matches common chronological few-shot splits.",
+    )
+    parser.add_argument(
+        "--min-selection-updates",
+        type=int,
+        default=500,
+        help=(
+            "Minimum optimizer updates before teacher-convergence checkpointing can trigger. "
+            "This prevents few-shot runs from stopping after only a few dozen updates."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -158,6 +174,25 @@ def make_grad_scaler(enabled: bool) -> object:
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def subset_training_windows(dataset: torch.utils.data.Dataset, fraction: float, mode: str, seed: int) -> torch.utils.data.Dataset:
+    if not 0 < fraction <= 1:
+        raise ValueError("--train-fraction must be in the range (0, 1].")
+    if fraction >= 1.0:
+        return dataset
+
+    train_size = max(1, int(len(dataset) * fraction))
+    if mode == "first":
+        indices = list(range(train_size))
+    elif mode == "uniform":
+        indices = torch.linspace(0, len(dataset) - 1, steps=train_size).round().long().tolist()
+    elif mode == "random":
+        generator = torch.Generator().manual_seed(seed)
+        indices = torch.randperm(len(dataset), generator=generator)[:train_size].sort().values.tolist()
+    else:
+        raise ValueError(f"Unknown train sampling mode: {mode}")
+    return torch.utils.data.Subset(dataset, indices)
+
+
 def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) -> dict[str, float]:
     seed_everything(args.seed + horizon)
     if device.type == "cuda":
@@ -168,11 +203,7 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
         prediction_length=horizon,
         stride=1,
     )
-    if not 0 < args.train_fraction <= 1:
-        raise ValueError("--train-fraction must be in the range (0, 1].")
-    if args.train_fraction < 1.0:
-        train_size = max(1, int(len(train_set) * args.train_fraction))
-        train_set = torch.utils.data.Subset(train_set, range(train_size))
+    train_set = subset_training_windows(train_set, args.train_fraction, args.train_sampling, args.seed + horizon)
 
     loader_kwargs = {
         "num_workers": args.num_workers,
@@ -183,6 +214,17 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
     valid_loader = DataLoader(valid_set, batch_size=args.batch_size, **loader_kwargs)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, **loader_kwargs)
     updates_per_epoch = len(train_loader)
+    min_update_epochs = 1
+    if args.min_selection_updates > 0:
+        min_update_epochs = math.ceil(args.min_selection_updates / max(updates_per_epoch, 1))
+    effective_min_epochs = min(args.epochs, max(args.min_epochs, min_update_epochs))
+    total_planned_updates = updates_per_epoch * args.epochs
+    if args.selection_branch == "teacher_convergence" and total_planned_updates < args.min_selection_updates:
+        print(
+            f"Warning: horizon={horizon} has only {total_planned_updates} planned optimizer updates, "
+            f"below --min-selection-updates={args.min_selection_updates}. Increase --epochs for few-shot runs.",
+            flush=True,
+        )
 
     sample_x, _ = train_set[0]
     config = TLLMConfig(
@@ -223,7 +265,6 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
     best_selection_mse = float("inf")
     no_improve_epochs = 0
     stopped_epoch = args.epochs
-    effective_min_epochs = min(args.min_epochs, args.epochs)
     best_state = None
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -307,6 +348,8 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
         "test_mae": test_mae,
         "train_windows": len(train_set),
         "optimizer_updates": updates_per_epoch * stopped_epoch,
+        "updates_per_epoch": updates_per_epoch,
+        "effective_min_epochs": effective_min_epochs,
         "paper_fewshot_mse": paper_fewshot["mse"],
         "paper_fewshot_mae": paper_fewshot["mae"],
     }
@@ -349,9 +392,11 @@ def main() -> None:
         "batch_size": args.batch_size,
         "lr": args.lr,
         "train_fraction": args.train_fraction,
+        "train_sampling": args.train_sampling,
         "amp": args.amp,
         "selection_branch": args.selection_branch,
         "min_epochs": args.min_epochs,
+        "min_selection_updates": args.min_selection_updates,
         "patience": args.patience,
         "min_delta": args.min_delta,
         "loss_weights": {
