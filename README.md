@@ -26,6 +26,32 @@ pip install -e ".[dev]"
 python scripts/smoke_train.py
 ```
 
+## ETTh1 Paper Protocol On CUDA / WSL
+
+The paper's long-term ETTh1 setting uses an input length of 96 and prediction
+horizons of 96, 192, 336, and 720. The reproduction script downloads ETTh1 when
+`data/ETT-small/ETTh1.csv` is missing, trains the temporal teacher and GPT-2
+LoRA student together, and evaluates with the student branch only. In the GPT-2
+path, the input block builds the paper-style compact word-embedding dictionary
+from the frozen GPT-2 embeddings and uses cross attention to produce the LLM
+student tokens separately from the temporal teacher tokens.
+The default optimizer is Adam with learning rate `0.0005`, and the loss weights
+follow the paper's `lambda1=1.0` for prediction imitation, `lambda2=0.01` for
+temporal guidance, and `lambda3=1.0` for student supervision.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+python scripts/run_etth1_paper_protocol.py --device cuda --amp
+```
+
+For a quick CUDA smoke run before the full experiment:
+
+```bash
+python scripts/run_etth1_paper_protocol.py --device cuda --horizons 96 --epochs 1 --batch-size 16 --amp
+```
+
 ## Train On A CSV
 
 ```bash

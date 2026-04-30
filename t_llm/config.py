@@ -16,6 +16,7 @@ class TLLMConfig:
     lora_rank: int = 8
     lora_alpha: float = 16.0
     lora_dropout: float = 0.05
+    llm_dictionary_size: int = 1024
     moving_average_kernel: int = 25
     spectral_capacity_schedule: dict[int, int] = field(
         default_factory=lambda: {24: 16, 48: 24, 96: 32, 192: 48, 336: 64, 720: 96}
@@ -29,5 +30,5 @@ class TLLMConfig:
             if self.prediction_length <= horizon
         ]
         chosen = eligible[0] if eligible else max(self.spectral_capacity_schedule.values())
-        max_bins = self.context_length // 2 + 1
+        max_bins = self.d_model // 2 + 1
         return max(1, min(chosen, max_bins))

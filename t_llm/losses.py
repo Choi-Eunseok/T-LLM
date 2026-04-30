@@ -9,8 +9,8 @@ from torch.nn import functional as F
 class DistillationLossConfig:
     teacher_weight: float = 1.0
     student_weight: float = 1.0
-    imitation_weight: float = 0.5
-    guidance_weight: float = 0.1
+    imitation_weight: float = 1.0
+    guidance_weight: float = 0.01
     head_guidance_weight: float = 0.5
     tail_guidance_weight: float = 0.5
 
@@ -73,4 +73,3 @@ class DistillationLoss(nn.Module):
             "guidance": guidance_loss.detach(),
         }
         return total, parts
-

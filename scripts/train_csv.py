@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from t_llm import DistillationLoss, TLLM, TLLMConfig
+from t_llm import DistillationLoss, DistillationLossConfig, TLLM, TLLMConfig
 from t_llm.data import SlidingWindowDataset, make_ett_hour_datasets
 
 
@@ -28,7 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--teacher-weight", type=float, default=1.0)
+    parser.add_argument("--student-weight", type=float, default=1.0)
+    parser.add_argument("--imitation-weight", type=float, default=1.0)
+    parser.add_argument("--guidance-weight", type=float, default=0.01)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--valid-ratio", type=float, default=0.2)
     parser.add_argument("--split", choices=["random", "ett-hour"], default="random")
@@ -111,9 +115,15 @@ def main() -> None:
         lora_dropout=args.lora_dropout,
     )
     model = TLLM(config).to(device)
-    criterion = DistillationLoss(config.d_model).to(device)
+    loss_config = DistillationLossConfig(
+        teacher_weight=args.teacher_weight,
+        student_weight=args.student_weight,
+        imitation_weight=args.imitation_weight,
+        guidance_weight=args.guidance_weight,
+    )
+    criterion = DistillationLoss(config.d_model, loss_config).to(device)
     trainable_parameters = [parameter for parameter in list(model.parameters()) + list(criterion.parameters()) if parameter.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr)
+    optimizer = torch.optim.Adam(trainable_parameters, lr=args.lr)
 
     best_mse = float("inf")
     args.checkpoint.parent.mkdir(parents=True, exist_ok=True)

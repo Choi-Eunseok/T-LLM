@@ -14,29 +14,68 @@ class MovingAverageDecomposition(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         pad = (self.kernel_size - 1) // 2
+        batch, channels, features = x.shape
         trend = F.avg_pool1d(
-            x.transpose(1, 2),
+            x.reshape(batch * channels, 1, features),
             kernel_size=self.kernel_size,
             stride=1,
             padding=pad,
             count_include_pad=False,
-        ).transpose(1, 2)
+        ).reshape(batch, channels, features)
         seasonal = x - trend
         return trend, seasonal
 
 
 class InputBlock(nn.Module):
-    def __init__(self, channels: int, context_length: int, d_model: int, n_heads: int, dropout: float) -> None:
+    def __init__(
+        self,
+        channels: int,
+        context_length: int,
+        d_model: int,
+        n_heads: int,
+        dropout: float,
+        llm_dictionary: torch.Tensor | None = None,
+        dictionary_size: int = 1024,
+    ) -> None:
         super().__init__()
         self.channel_embedding = nn.Linear(context_length, d_model)
         self.channel_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
+        self.teacher_norm = nn.LayerNorm(d_model)
+        self.cross_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.student_norm = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if llm_dictionary is None:
+            self.learned_dictionary = nn.Parameter(torch.randn(dictionary_size, d_model) * 0.02)
+            self.register_buffer("llm_dictionary", torch.empty(0), persistent=False)
+        else:
+            dictionary = self._compact_dictionary(llm_dictionary.detach(), dictionary_size)
+            self.learned_dictionary = None
+            self.register_buffer("llm_dictionary", dictionary, persistent=False)
+
+    @staticmethod
+    def _compact_dictionary(embedding: torch.Tensor, dictionary_size: int) -> torch.Tensor:
+        if embedding.ndim != 2:
+            raise ValueError("llm_dictionary must have shape [vocab_size, d_model]")
+        size = min(dictionary_size, embedding.size(0))
+        indices = torch.linspace(0, embedding.size(0) - 1, steps=size, device=embedding.device).round().long()
+        return embedding.index_select(0, indices).clone()
+
+    def dictionary(self) -> torch.Tensor:
+        if self.learned_dictionary is not None:
+            return self.learned_dictionary
+        return self.llm_dictionary
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Treat channels as tokens and history as the token feature vector.
         tokens = self.channel_embedding(x.transpose(1, 2))
         attended, _ = self.channel_attention(tokens, tokens, tokens, need_weights=False)
-        return self.norm(tokens + attended)
+        teacher_tokens = self.teacher_norm(tokens + attended)
+
+        dictionary = self.dictionary().to(dtype=teacher_tokens.dtype, device=teacher_tokens.device)
+        dictionary = dictionary.unsqueeze(0).expand(teacher_tokens.size(0), -1, -1)
+        student_tokens, _ = self.cross_attention(teacher_tokens, dictionary, dictionary, need_weights=False)
+        student_tokens = self.student_norm(teacher_tokens + student_tokens)
+        return teacher_tokens, student_tokens
 
 
 class DLinearTrendBlock(nn.Module):
@@ -56,8 +95,10 @@ class DLinearTrendBlock(nn.Module):
 class AdaptiveSpectralBlock(nn.Module):
     def __init__(self, channels: int, d_model: int, spectral_bins: int, dropout: float) -> None:
         super().__init__()
-        self.spectral_bins = max(1, min(spectral_bins, d_model // 2 + 1))
+        self.full_bins = d_model // 2 + 1
+        self.spectral_bins = max(1, min(spectral_bins, self.full_bins))
         self.threshold = nn.Parameter(torch.tensor(0.1))
+        self.dsp_projection = nn.Parameter(torch.empty(self.full_bins, self.spectral_bins))
         self.global_real = nn.Parameter(torch.randn(channels, self.spectral_bins) * 0.02)
         self.global_imag = nn.Parameter(torch.randn(channels, self.spectral_bins) * 0.02)
         self.local_real = nn.Parameter(torch.randn(channels, self.spectral_bins) * 0.02)
@@ -70,13 +111,11 @@ class AdaptiveSpectralBlock(nn.Module):
             nn.Linear(d_model, 1),
         )
         self.norm = nn.LayerNorm(d_model)
+        nn.init.xavier_uniform_(self.dsp_projection)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         spectrum = torch.fft.rfft(tokens, dim=-1)
-        spectrum = spectrum[:, :, : self.spectral_bins]
-        if spectrum.size(-1) < self.spectral_bins:
-            pad = self.spectral_bins - spectrum.size(-1)
-            spectrum = F.pad(spectrum, (0, pad))
+        spectrum = torch.einsum("bcf,fk->bck", spectrum, self.dsp_projection.to(spectrum.dtype))
 
         power = spectrum.abs().pow(2)
         cutoff = power.detach().mean(dim=-1, keepdim=True) + self.threshold.sigmoid() * power.detach().std(
@@ -100,7 +139,7 @@ class TrendPeriodicFusion(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
         self.gate = nn.Sequential(
-            nn.Linear(d_model * 2 + 1, d_model),
+            nn.Linear(3, d_model),
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
@@ -112,7 +151,9 @@ class TrendPeriodicFusion(nn.Module):
             dtype=trend.dtype,
             device=trend.device,
         )
-        alpha = torch.sigmoid(self.gate(torch.cat([trend, periodic, horizon], dim=-1)))
+        trend_summary = trend.mean(dim=-1, keepdim=True)
+        periodic_summary = periodic.mean(dim=-1, keepdim=True)
+        alpha = torch.sigmoid(self.gate(torch.cat([trend_summary, periodic_summary, horizon], dim=-1)))
         return alpha * trend + (1.0 - alpha) * periodic
 
 

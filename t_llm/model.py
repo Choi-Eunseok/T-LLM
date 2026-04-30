@@ -148,6 +148,9 @@ class GPT2LoRAStudent(nn.Module):
         )
         self.head = ForecastHead(config.channels, config.d_model, config.prediction_length)
 
+    def word_embeddings(self) -> torch.Tensor:
+        return self.gpt2.wte.weight
+
     def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         outputs = self.gpt2(inputs_embeds=tokens, output_hidden_states=True, use_cache=False, return_dict=True)
         hidden_states = outputs.hidden_states
@@ -162,30 +165,34 @@ class TLLM(nn.Module):
     def __init__(self, config: TLLMConfig) -> None:
         super().__init__()
         self.config = config
+        if config.student_type == "transformer":
+            self.student = TransformerStudent(config)
+            llm_dictionary = None
+        elif config.student_type == "gpt2_lora":
+            self.student = GPT2LoRAStudent(config)
+            llm_dictionary = self.student.word_embeddings()
+        else:
+            raise ValueError(f"Unknown student_type: {config.student_type}")
         self.input_block = InputBlock(
             config.channels,
             config.context_length,
             config.d_model,
             config.n_heads,
             config.dropout,
+            llm_dictionary=llm_dictionary,
+            dictionary_size=config.llm_dictionary_size,
         )
         self.teacher = TemporalTeacher(config)
-        if config.student_type == "transformer":
-            self.student = TransformerStudent(config)
-        elif config.student_type == "gpt2_lora":
-            self.student = GPT2LoRAStudent(config)
-        else:
-            raise ValueError(f"Unknown student_type: {config.student_type}")
 
     def forward(self, x: torch.Tensor, include_teacher: bool = True) -> dict[str, object]:
-        tokens = self.input_block(x)
-        student_pred, student_features = self.student(tokens)
+        teacher_tokens, student_tokens = self.input_block(x)
+        student_pred, student_features = self.student(student_tokens)
         output: dict[str, object] = {
             "student_pred": student_pred,
             "student_features": student_features,
         }
         if include_teacher:
-            teacher_pred, teacher_features = self.teacher(tokens)
+            teacher_pred, teacher_features = self.teacher(teacher_tokens)
             output["teacher_pred"] = teacher_pred
             output["teacher_features"] = teacher_features
         return output

@@ -16,7 +16,7 @@ def main() -> None:
     )
     model = TLLM(config)
     criterion = DistillationLoss(config.d_model)
-    optimizer = torch.optim.AdamW(list(model.parameters()) + list(criterion.parameters()), lr=1e-3)
+    optimizer = torch.optim.Adam(list(model.parameters()) + list(criterion.parameters()), lr=5e-4)
 
     x = torch.randn(8, config.context_length, config.channels)
     y = torch.randn(8, config.prediction_length, config.channels)
@@ -33,4 +33,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
