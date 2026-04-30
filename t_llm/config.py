@@ -17,6 +17,8 @@ class TLLMConfig:
     lora_alpha: float = 16.0
     lora_dropout: float = 0.05
     llm_dictionary_size: int = 1024
+    input_residual: bool = True
+    spectral_mask_mode: str = "adaptive_stats"
     moving_average_kernel: int = 25
     spectral_capacity_schedule: dict[int, int] = field(
         default_factory=lambda: {24: 16, 48: 24, 96: 32, 192: 48, 336: 64, 720: 96}

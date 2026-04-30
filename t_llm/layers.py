@@ -36,8 +36,10 @@ class InputBlock(nn.Module):
         dropout: float,
         llm_dictionary: torch.Tensor | None = None,
         dictionary_size: int = 1024,
+        input_residual: bool = True,
     ) -> None:
         super().__init__()
+        self.input_residual = input_residual
         self.channel_embedding = nn.Linear(context_length, d_model)
         self.channel_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.teacher_norm = nn.LayerNorm(d_model)
@@ -69,12 +71,18 @@ class InputBlock(nn.Module):
         # Treat channels as tokens and history as the token feature vector.
         tokens = self.channel_embedding(x.transpose(1, 2))
         attended, _ = self.channel_attention(tokens, tokens, tokens, need_weights=False)
-        teacher_tokens = self.teacher_norm(attended)
+        if self.input_residual:
+            teacher_tokens = self.teacher_norm(tokens + attended)
+        else:
+            teacher_tokens = self.teacher_norm(attended)
 
         dictionary = self.dictionary().to(dtype=teacher_tokens.dtype, device=teacher_tokens.device)
         dictionary = dictionary.unsqueeze(0).expand(teacher_tokens.size(0), -1, -1)
         student_tokens, _ = self.cross_attention(teacher_tokens, dictionary, dictionary, need_weights=False)
-        student_tokens = self.student_norm(student_tokens)
+        if self.input_residual:
+            student_tokens = self.student_norm(teacher_tokens + student_tokens)
+        else:
+            student_tokens = self.student_norm(student_tokens)
         return teacher_tokens, student_tokens
 
 
@@ -93,8 +101,9 @@ class DLinearTrendBlock(nn.Module):
 
 
 class AdaptiveSpectralBlock(nn.Module):
-    def __init__(self, channels: int, d_model: int, spectral_bins: int, dropout: float) -> None:
+    def __init__(self, channels: int, d_model: int, spectral_bins: int, dropout: float, mask_mode: str) -> None:
         super().__init__()
+        self.mask_mode = mask_mode
         self.full_bins = d_model // 2 + 1
         self.spectral_bins = max(1, min(spectral_bins, self.full_bins))
         self.threshold = nn.Parameter(torch.tensor(0.1))
@@ -118,7 +127,17 @@ class AdaptiveSpectralBlock(nn.Module):
         spectrum = torch.einsum("bcf,fk->bck", spectrum, self.dsp_projection.to(spectrum.dtype))
 
         power = spectrum.abs().pow(2)
-        mask = (power > self.threshold).to(spectrum.dtype)
+        if self.mask_mode == "paper_threshold":
+            mask = (power > self.threshold).to(spectrum.dtype)
+        elif self.mask_mode == "adaptive_stats":
+            cutoff = power.detach().mean(dim=-1, keepdim=True) + self.threshold.sigmoid() * power.detach().std(
+                dim=-1,
+                keepdim=True,
+                unbiased=False,
+            )
+            mask = (power >= cutoff).to(spectrum.dtype)
+        else:
+            raise ValueError(f"Unknown spectral mask mode: {self.mask_mode}")
 
         global_weight = torch.complex(self.global_real, self.global_imag)
         local_weight = torch.complex(self.local_real, self.local_imag)

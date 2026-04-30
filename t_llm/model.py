@@ -66,7 +66,13 @@ class TemporalTeacher(nn.Module):
         )
         self.spectral_blocks = nn.ModuleList(
             [
-                AdaptiveSpectralBlock(config.channels, config.d_model, config.spectral_bins, config.dropout)
+                AdaptiveSpectralBlock(
+                    config.channels,
+                    config.d_model,
+                    config.spectral_bins,
+                    config.dropout,
+                    config.spectral_mask_mode,
+                )
                 for _ in range(config.teacher_layers)
             ]
         )
@@ -181,6 +187,7 @@ class TLLM(nn.Module):
             config.dropout,
             llm_dictionary=llm_dictionary,
             dictionary_size=config.llm_dictionary_size,
+            input_residual=config.input_residual,
         )
         self.teacher = TemporalTeacher(config)
 

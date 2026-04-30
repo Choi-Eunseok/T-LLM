@@ -43,10 +43,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--llm-dictionary-size", type=int, default=1024)
+    parser.add_argument("--no-input-residual", action="store_true", help="Use the paper equations literally without Input Block residuals.")
+    parser.add_argument(
+        "--spectral-mask-mode",
+        choices=["adaptive_stats", "paper_threshold"],
+        default="adaptive_stats",
+        help="adaptive_stats is more stable with projected spectra; paper_threshold follows Eq. 26 literally.",
+    )
     parser.add_argument("--teacher-weight", type=float, default=1.0)
     parser.add_argument("--student-weight", type=float, default=1.0)
     parser.add_argument("--imitation-weight", type=float, default=1.0)
     parser.add_argument("--guidance-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--selection-branch",
+        choices=["student", "teacher", "mean"],
+        default="student",
+        help="Which validation branch chooses the checkpoint. Student is the inference branch.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=Path, default=Path("results/etth1_paper_protocol.json"))
     parser.add_argument("--quiet", action="store_true", help="Disable per-batch tqdm output.")
@@ -165,6 +178,8 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         llm_dictionary_size=args.llm_dictionary_size,
+        input_residual=not args.no_input_residual,
+        spectral_mask_mode=args.spectral_mask_mode,
     )
     model = TLLM(config).to(device)
     loss_config = DistillationLossConfig(
@@ -184,6 +199,7 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
     best_valid_teacher_mae = float("inf")
     best_valid_student_mse = float("inf")
     best_valid_student_mae = float("inf")
+    best_selection_mse = float("inf")
     best_state = None
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -211,7 +227,15 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
 
         valid_teacher_mse, valid_teacher_mae = evaluate(model, valid_loader, device, branch="teacher")
         valid_student_mse, valid_student_mae = evaluate(model, valid_loader, device, branch="student")
-        if valid_teacher_mse < best_valid_teacher_mse:
+        if args.selection_branch == "teacher":
+            selection_mse = valid_teacher_mse
+        elif args.selection_branch == "student":
+            selection_mse = valid_student_mse
+        else:
+            selection_mse = 0.5 * (valid_teacher_mse + valid_student_mse)
+
+        if selection_mse < best_selection_mse:
+            best_selection_mse = selection_mse
             best_valid_teacher_mse = valid_teacher_mse
             best_epoch = epoch
             best_valid_teacher_mae = valid_teacher_mae
@@ -281,10 +305,13 @@ def main() -> None:
         "student_layers": args.student_layers,
         "teacher_layers": args.teacher_layers,
         "llm_dictionary_size": args.llm_dictionary_size,
+        "input_residual": not args.no_input_residual,
+        "spectral_mask_mode": args.spectral_mask_mode,
         "batch_size": args.batch_size,
         "lr": args.lr,
         "train_fraction": args.train_fraction,
         "amp": args.amp,
+        "selection_branch": args.selection_branch,
         "loss_weights": {
             "teacher": args.teacher_weight,
             "student": args.student_weight,
