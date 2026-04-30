@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--d-model", type=int, default=768)
     parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--teacher-layers", type=int, default=1)
+    parser.add_argument("--teacher-layers", type=int, default=2)
     parser.add_argument("--student-type", choices=["transformer", "gpt2_lora"], default="gpt2_lora")
     parser.add_argument("--student-layers", type=int, default=6)
     parser.add_argument("--gpt2-model-name", default="gpt2")
@@ -56,9 +56,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-weight", type=float, default=0.01)
     parser.add_argument(
         "--selection-branch",
-        choices=["student", "teacher", "mean"],
-        default="student",
-        help="Which validation branch chooses the checkpoint. Student is the inference branch.",
+        choices=["teacher_convergence", "teacher", "student", "mean"],
+        default="teacher_convergence",
+        help=(
+            "Which validation signal chooses the checkpoint. teacher_convergence follows the paper's "
+            "teacher-convergence idea by ignoring early teacher minima before --min-epochs."
+        ),
+    )
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=5,
+        help="Minimum training epochs before teacher-convergence checkpointing or early stopping can trigger.",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=3,
+        help="Early-stop patience for --selection-branch teacher_convergence. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=0.0,
+        help="Minimum validation MSE improvement counted by teacher-convergence early stopping.",
     )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--out", type=Path, default=Path("results/etth1_paper_protocol.json"))
@@ -200,6 +221,9 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
     best_valid_student_mse = float("inf")
     best_valid_student_mae = float("inf")
     best_selection_mse = float("inf")
+    no_improve_epochs = 0
+    stopped_epoch = args.epochs
+    effective_min_epochs = min(args.min_epochs, args.epochs)
     best_state = None
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -227,14 +251,16 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
 
         valid_teacher_mse, valid_teacher_mae = evaluate(model, valid_loader, device, branch="teacher")
         valid_student_mse, valid_student_mae = evaluate(model, valid_loader, device, branch="student")
-        if args.selection_branch == "teacher":
+        eligible_for_selection = args.selection_branch != "teacher_convergence" or epoch >= effective_min_epochs
+        if args.selection_branch in {"teacher", "teacher_convergence"}:
             selection_mse = valid_teacher_mse
         elif args.selection_branch == "student":
             selection_mse = valid_student_mse
         else:
             selection_mse = 0.5 * (valid_teacher_mse + valid_student_mse)
 
-        if selection_mse < best_selection_mse:
+        improved = selection_mse < best_selection_mse - args.min_delta
+        if eligible_for_selection and (best_state is None or improved):
             best_selection_mse = selection_mse
             best_valid_teacher_mse = valid_teacher_mse
             best_epoch = epoch
@@ -242,6 +268,9 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
             best_valid_student_mse = valid_student_mse
             best_valid_student_mae = valid_student_mae
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+            no_improve_epochs = 0
+        elif eligible_for_selection:
+            no_improve_epochs += 1
         print(
             f"horizon={horizon} epoch={epoch} "
             f"train_loss={train_loss / max(train_count, 1):.6f} "
@@ -249,6 +278,14 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
             f"valid_student_mse={valid_student_mse:.6f} valid_student_mae={valid_student_mae:.6f}",
             flush=True,
         )
+        if (
+            args.selection_branch == "teacher_convergence"
+            and args.patience > 0
+            and epoch >= effective_min_epochs
+            and no_improve_epochs >= args.patience
+        ):
+            stopped_epoch = epoch
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -258,6 +295,8 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
     result = {
         "horizon": horizon,
         "best_epoch": best_epoch,
+        "stopped_epoch": stopped_epoch,
+        "best_selection_mse": best_selection_mse,
         "best_valid_teacher_mse": best_valid_teacher_mse,
         "best_valid_teacher_mae": best_valid_teacher_mae,
         "best_valid_student_mse": best_valid_student_mse,
@@ -267,7 +306,7 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
         "test_mse": test_mse,
         "test_mae": test_mae,
         "train_windows": len(train_set),
-        "optimizer_updates": updates_per_epoch * args.epochs,
+        "optimizer_updates": updates_per_epoch * stopped_epoch,
         "paper_fewshot_mse": paper_fewshot["mse"],
         "paper_fewshot_mae": paper_fewshot["mae"],
     }
@@ -312,6 +351,9 @@ def main() -> None:
         "train_fraction": args.train_fraction,
         "amp": args.amp,
         "selection_branch": args.selection_branch,
+        "min_epochs": args.min_epochs,
+        "patience": args.patience,
+        "min_delta": args.min_delta,
         "loss_weights": {
             "teacher": args.teacher_weight,
             "student": args.student_weight,
