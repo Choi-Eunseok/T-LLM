@@ -17,8 +17,9 @@ class TLLMConfig:
     lora_alpha: float = 16.0
     lora_dropout: float = 0.05
     llm_dictionary_size: int = 1024
+    llm_dictionary_mode: str = "projection"
     input_residual: bool = True
-    spectral_mask_mode: str = "adaptive_stats"
+    spectral_mask_mode: str = "paper_threshold"
     moving_average_kernel: int = 25
     spectral_capacity_schedule: dict[int, int] = field(
         default_factory=lambda: {24: 16, 48: 24, 96: 32, 192: 48, 336: 64, 720: 96}
@@ -26,11 +27,9 @@ class TLLMConfig:
 
     @property
     def spectral_bins(self) -> int:
-        eligible = [
-            capacity
-            for horizon, capacity in sorted(self.spectral_capacity_schedule.items())
-            if self.prediction_length <= horizon
-        ]
-        chosen = eligible[0] if eligible else max(self.spectral_capacity_schedule.values())
+        chosen = min(
+            self.spectral_capacity_schedule.items(),
+            key=lambda item: abs(self.prediction_length - item[0]),
+        )[1]
         max_bins = self.d_model // 2 + 1
         return max(1, min(chosen, max_bins))

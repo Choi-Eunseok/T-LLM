@@ -36,6 +36,7 @@ class InputBlock(nn.Module):
         dropout: float,
         llm_dictionary: torch.Tensor | None = None,
         dictionary_size: int = 1024,
+        dictionary_mode: str = "projection",
         input_residual: bool = True,
     ) -> None:
         super().__init__()
@@ -48,11 +49,25 @@ class InputBlock(nn.Module):
 
         if llm_dictionary is None:
             self.learned_dictionary = nn.Parameter(torch.randn(dictionary_size, d_model) * 0.02)
+            self.vocab_projection = None
             self.register_buffer("llm_dictionary", torch.empty(0), persistent=False)
-        else:
+            self.register_buffer("source_dictionary", torch.empty(0), persistent=False)
+        elif dictionary_mode == "sampled":
             dictionary = self._compact_dictionary(llm_dictionary.detach(), dictionary_size)
             self.learned_dictionary = None
+            self.vocab_projection = None
             self.register_buffer("llm_dictionary", dictionary, persistent=False)
+            self.register_buffer("source_dictionary", torch.empty(0), persistent=False)
+        elif dictionary_mode == "projection":
+            if llm_dictionary.ndim != 2:
+                raise ValueError("llm_dictionary must have shape [vocab_size, d_model]")
+            self.learned_dictionary = None
+            self.vocab_projection = nn.Linear(llm_dictionary.size(0), dictionary_size, bias=False)
+            nn.init.xavier_uniform_(self.vocab_projection.weight)
+            self.register_buffer("source_dictionary", llm_dictionary.detach().clone(), persistent=False)
+            self.register_buffer("llm_dictionary", torch.empty(0), persistent=False)
+        else:
+            raise ValueError(f"Unknown dictionary_mode: {dictionary_mode}")
 
     @staticmethod
     def _compact_dictionary(embedding: torch.Tensor, dictionary_size: int) -> torch.Tensor:
@@ -65,6 +80,8 @@ class InputBlock(nn.Module):
     def dictionary(self) -> torch.Tensor:
         if self.learned_dictionary is not None:
             return self.learned_dictionary
+        if self.vocab_projection is not None:
+            return self.vocab_projection(self.source_dictionary.transpose(0, 1)).transpose(0, 1)
         return self.llm_dictionary
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

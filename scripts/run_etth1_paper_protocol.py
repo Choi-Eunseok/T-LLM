@@ -28,6 +28,15 @@ PAPER_ETTH1_FEWSHOT_BY_HORIZON = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run ETTh1 long-term forecasting protocol from the T-LLM paper.")
+    parser.add_argument(
+        "--preset",
+        choices=["paper_strict", "repro_stable"],
+        default="paper_strict",
+        help=(
+            "paper_strict follows the paper equations as literally as possible. "
+            "repro_stable enables implementation choices that were useful in local debugging."
+        ),
+    )
     parser.add_argument("--csv", type=Path, default=Path("data/ETT-small/ETTh1.csv"))
     parser.add_argument("--context-length", type=int, default=96)
     parser.add_argument("--horizons", type=int, nargs="+", default=[96, 192, 336, 720])
@@ -44,11 +53,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--llm-dictionary-size", type=int, default=1024)
+    parser.add_argument(
+        "--llm-dictionary-mode",
+        choices=["projection", "sampled"],
+        default=None,
+        help="projection learns a compact dictionary from the full GPT-2 vocabulary; sampled uses evenly spaced tokens.",
+    )
     parser.add_argument("--no-input-residual", action="store_true", help="Use the paper equations literally without Input Block residuals.")
     parser.add_argument(
         "--spectral-mask-mode",
         choices=["adaptive_stats", "paper_threshold"],
-        default="adaptive_stats",
+        default=None,
         help="adaptive_stats is more stable with projected spectra; paper_threshold follows Eq. 26 literally.",
     )
     parser.add_argument("--teacher-weight", type=float, default=1.0)
@@ -58,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--selection-branch",
         choices=["teacher_convergence", "teacher", "student", "mean"],
-        default="teacher_convergence",
+        default=None,
         help=(
             "Which validation signal chooses the checkpoint. teacher_convergence follows the paper's "
             "teacher-convergence idea by ignoring early teacher minima before --min-epochs."
@@ -98,13 +113,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-sampling",
         choices=["first", "uniform", "random"],
-        default="first",
-        help="How to select windows when --train-fraction < 1. first matches common chronological few-shot splits.",
+        default=None,
+        help=(
+            "How to select windows when --train-fraction < 1. uniform preserves coverage of the full training period; "
+            "first is a stricter chronological prefix split."
+        ),
     )
     parser.add_argument(
         "--min-selection-updates",
         type=int,
-        default=500,
+        default=None,
         help=(
             "Minimum optimizer updates before teacher-convergence checkpointing can trigger. "
             "This prevents few-shot runs from stopping after only a few dozen updates."
@@ -174,6 +192,34 @@ def make_grad_scaler(enabled: bool) -> object:
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def apply_preset_defaults(args: argparse.Namespace) -> None:
+    if args.preset == "paper_strict":
+        if args.llm_dictionary_mode is None:
+            args.llm_dictionary_mode = "projection"
+        if args.spectral_mask_mode is None:
+            args.spectral_mask_mode = "paper_threshold"
+        if args.selection_branch is None:
+            args.selection_branch = "teacher"
+        if args.train_sampling is None:
+            args.train_sampling = "uniform"
+        if args.min_selection_updates is None:
+            args.min_selection_updates = 0
+        args.no_input_residual = True
+    elif args.preset == "repro_stable":
+        if args.llm_dictionary_mode is None:
+            args.llm_dictionary_mode = "projection"
+        if args.spectral_mask_mode is None:
+            args.spectral_mask_mode = "adaptive_stats"
+        if args.selection_branch is None:
+            args.selection_branch = "teacher_convergence"
+        if args.train_sampling is None:
+            args.train_sampling = "uniform"
+        if args.min_selection_updates is None:
+            args.min_selection_updates = 500
+    else:
+        raise ValueError(f"Unknown preset: {args.preset}")
+
+
 def subset_training_windows(dataset: torch.utils.data.Dataset, fraction: float, mode: str, seed: int) -> torch.utils.data.Dataset:
     if not 0 < fraction <= 1:
         raise ValueError("--train-fraction must be in the range (0, 1].")
@@ -241,6 +287,7 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
         llm_dictionary_size=args.llm_dictionary_size,
+        llm_dictionary_mode=args.llm_dictionary_mode,
         input_residual=not args.no_input_residual,
         spectral_mask_mode=args.spectral_mask_mode,
     )
@@ -361,6 +408,7 @@ def run_horizon(args: argparse.Namespace, horizon: int, device: torch.device) ->
 
 def main() -> None:
     args = parse_args()
+    apply_preset_defaults(args)
     if not args.csv.exists():
         if args.no_download:
             raise FileNotFoundError(f"{args.csv} does not exist.")
@@ -387,6 +435,7 @@ def main() -> None:
         "student_layers": args.student_layers,
         "teacher_layers": args.teacher_layers,
         "llm_dictionary_size": args.llm_dictionary_size,
+        "llm_dictionary_mode": args.llm_dictionary_mode,
         "input_residual": not args.no_input_residual,
         "spectral_mask_mode": args.spectral_mask_mode,
         "batch_size": args.batch_size,
@@ -395,6 +444,7 @@ def main() -> None:
         "train_sampling": args.train_sampling,
         "amp": args.amp,
         "selection_branch": args.selection_branch,
+        "preset": args.preset,
         "min_epochs": args.min_epochs,
         "min_selection_updates": args.min_selection_updates,
         "patience": args.patience,

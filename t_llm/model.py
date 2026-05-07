@@ -187,6 +187,7 @@ class TLLM(nn.Module):
             config.dropout,
             llm_dictionary=llm_dictionary,
             dictionary_size=config.llm_dictionary_size,
+            dictionary_mode=config.llm_dictionary_mode,
             input_residual=config.input_residual,
         )
         self.teacher = TemporalTeacher(config)

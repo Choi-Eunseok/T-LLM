@@ -56,6 +56,12 @@ def test_spectral_bins_are_selected_from_latent_dimension() -> None:
     assert config.spectral_bins == 65
 
 
+def test_spectral_bins_use_nearest_horizon_capacity() -> None:
+    config = TLLMConfig(context_length=24, prediction_length=100, d_model=768)
+
+    assert config.spectral_bins == 32
+
+
 def test_distillation_defaults_match_paper_hyperparameters() -> None:
     config = DistillationLossConfig()
 
