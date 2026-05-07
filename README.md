@@ -52,6 +52,24 @@ For a quick CUDA smoke run before the full experiment:
 python scripts/run_etth1_paper_protocol.py --device cuda --horizons 96 --epochs 1 --batch-size 16 --amp
 ```
 
+## Time-LLM Baseline
+
+To compare against a Time-LLM-style baseline, this repo includes a GPT-2 version
+of Time-LLM with patch embedding, Prompt-as-Prefix, source-token mapping, a
+reprogramming layer, and a frozen GPT-2 backbone. The official ETTh1 script uses
+`seq_len=512`, `patch_len=16`, `stride=8`, `d_model=32`, `d_ff=128`,
+`batch_size=24`, and horizon-specific learning rates.
+
+```bash
+python scripts/run_etth1_time_llm.py --device cuda --amp --out results/etth1_time_llm.json
+```
+
+For a quick single-horizon check:
+
+```bash
+python scripts/run_etth1_time_llm.py --device cuda --horizons 96 --epochs 1 --batch-size 8 --amp
+```
+
 ## Train On A CSV
 
 ```bash

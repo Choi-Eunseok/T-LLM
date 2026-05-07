@@ -1,6 +1,7 @@
 import torch
 
 from t_llm import DistillationLoss, DistillationLossConfig, TLLM, TLLMConfig
+from t_llm.time_llm import TimeLLMConfig, PatchEmbedding, ReprogrammingLayer
 
 
 def test_tllm_forward_and_loss_shapes() -> None:
@@ -61,3 +62,24 @@ def test_distillation_defaults_match_paper_hyperparameters() -> None:
     assert config.student_weight == 1.0
     assert config.imitation_weight == 1.0
     assert config.guidance_weight == 0.01
+
+
+def test_time_llm_patch_embedding_shapes() -> None:
+    config = TimeLLMConfig(context_length=32, prediction_length=8, channels=3, d_model=16, patch_len=8, stride=4)
+    patch_embedding = PatchEmbedding(config.d_model, config.patch_len, config.stride, config.dropout)
+    x = torch.randn(2, config.channels, config.context_length)
+
+    tokens, n_vars = patch_embedding(x)
+
+    assert n_vars == config.channels
+    assert tokens.shape == (2 * config.channels, 8, config.d_model)
+
+
+def test_time_llm_reprogramming_shapes() -> None:
+    layer = ReprogrammingLayer(d_model=16, n_heads=4, d_keys=8, d_llm=32, dropout=0.0)
+    target = torch.randn(6, 8, 16)
+    source = torch.randn(100, 32)
+
+    out = layer(target, source, source)
+
+    assert out.shape == (6, 8, 32)
