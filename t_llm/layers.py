@@ -6,6 +6,41 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
+# RevIN (Reversible Instance Normalization)
+# ---------------------------------------------------------------------------
+
+class RevIN(nn.Module):
+    """
+    Per-sample, per-channel instance normalization (Kim et al., 2022).
+    normalize() stores stats; denormalize() inverts using stored stats.
+    Learnable affine params γ, β follow the original RevIN formulation.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-5, affine: bool = True) -> None:
+        super().__init__()
+        self.eps = eps
+        self.affine = affine
+        if affine:
+            self.gamma = nn.Parameter(torch.ones(channels))
+            self.beta  = nn.Parameter(torch.zeros(channels))
+
+    def normalize(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x: (B, L, C)
+        mean = x.mean(dim=1, keepdim=True)                          # (B, 1, C)
+        std  = x.std(dim=1, keepdim=True, unbiased=False)           # (B, 1, C)
+        x_norm = (x - mean) / (std + self.eps)
+        if self.affine:
+            x_norm = x_norm * self.gamma + self.beta
+        return x_norm, mean, std
+
+    def denormalize(self, x: torch.Tensor, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C)
+        if self.affine:
+            x = (x - self.beta) / (self.gamma + self.eps)
+        return x * (std + self.eps) + mean
+
+
+# ---------------------------------------------------------------------------
 # Moving-average decomposition (DLinear)
 # ---------------------------------------------------------------------------
 

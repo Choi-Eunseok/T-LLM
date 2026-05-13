@@ -89,12 +89,10 @@ def evaluate(model: TLLM, loader: DataLoader, device: torch.device) -> tuple[flo
 @torch.no_grad()
 def evaluate_teacher(model: TLLM, loader: DataLoader, device: torch.device) -> float:
     """Return teacher validation MSE (used for checkpoint selection)."""
-    model.eval()
     mse_sum = n = 0.0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        teacher_tokens, _ = model.input(x)
-        t_pred, _ = model.teacher(teacher_tokens)
+        t_pred = model.predict_teacher(x)
         mse_sum += torch.mean((t_pred - y) ** 2).item() * x.size(0)
         n += x.size(0)
     return mse_sum / max(n, 1)

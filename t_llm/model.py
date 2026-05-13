@@ -10,6 +10,7 @@ from .layers import (
     DLinearTrendBlock,
     ForecastHead,
     InputBlock,
+    RevIN,
     TrendPeriodicFusion,
 )
 
@@ -151,6 +152,7 @@ class TLLM(nn.Module):
     def __init__(self, cfg: TLLMConfig) -> None:
         super().__init__()
         self.cfg     = cfg
+        self.revin   = RevIN(cfg.channels)
         self.student = GPT2LoRAStudent(cfg)
         self.input   = InputBlock(
             context_length  = cfg.context_length,
@@ -163,11 +165,14 @@ class TLLM(nn.Module):
         self.teacher = TemporalTeacher(cfg)
 
     def forward(self, x: torch.Tensor, teacher: bool = True) -> dict[str, object]:
-        teacher_tokens, student_tokens = self.input(x)
-        s_pred, s_feat = self.student(student_tokens)
+        x_norm, mean, std = self.revin.normalize(x)
+        teacher_tokens, student_tokens = self.input(x_norm)
+        s_pred_norm, s_feat = self.student(student_tokens)
+        s_pred = self.revin.denormalize(s_pred_norm, mean, std)
         result: dict[str, object] = {"student_pred": s_pred, "student_features": s_feat}
         if teacher:
-            t_pred, t_feat = self.teacher(teacher_tokens)
+            t_pred_norm, t_feat = self.teacher(teacher_tokens)
+            t_pred = self.revin.denormalize(t_pred_norm, mean, std)
             result["teacher_pred"]     = t_pred
             result["teacher_features"] = t_feat
         return result
@@ -175,6 +180,15 @@ class TLLM(nn.Module):
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         self.eval()
-        _, student_tokens = self.input(x)
-        pred, _ = self.student(student_tokens)
-        return pred
+        x_norm, mean, std = self.revin.normalize(x)
+        _, student_tokens = self.input(x_norm)
+        pred_norm, _ = self.student(student_tokens)
+        return self.revin.denormalize(pred_norm, mean, std)
+
+    @torch.no_grad()
+    def predict_teacher(self, x: torch.Tensor) -> torch.Tensor:
+        self.eval()
+        x_norm, mean, std = self.revin.normalize(x)
+        teacher_tokens, _ = self.input(x_norm)
+        t_pred_norm, _ = self.teacher(teacher_tokens)
+        return self.revin.denormalize(t_pred_norm, mean, std)
