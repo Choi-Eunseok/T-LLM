@@ -178,8 +178,6 @@ class InputBlock(nn.Module):
         dictionary_size: int = 1024,
     ) -> None:
         super().__init__()
-        vocab_size = word_embeddings.size(0)
-
         # Eq. 3: embed each channel's history (length L) into d_model
         self.channel_embed = nn.Linear(context_length, d_model)
 
@@ -187,20 +185,20 @@ class InputBlock(nn.Module):
         self.self_attn  = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.teacher_norm = nn.LayerNorm(d_model)
 
-        # Compact dictionary D_hat: project full vocab to P tokens (Eq. 6)
-        self.vocab_proj = nn.Linear(vocab_size, dictionary_size, bias=False)
-        nn.init.xavier_uniform_(self.vocab_proj.weight)
-        self.register_buffer("source_vocab", word_embeddings.detach().clone(), persistent=False)
+        # Compact dictionary D_hat ∈ R^{P × d_model} (Eq. 6):
+        # Select P evenly-spaced rows from the GPT-2 word embedding matrix.
+        # "Constructed from D" — fixed buffer, no learned projection parameters.
+        vocab_size = word_embeddings.size(0)
+        idx = torch.linspace(0, vocab_size - 1, steps=dictionary_size).round().long()
+        compact = word_embeddings[idx].detach().clone()          # (P, d_model)
+        self.register_buffer("compact_dict", compact, persistent=False)
 
         # Eq. 6-7: cross-attention
         self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.student_norm = nn.LayerNorm(d_model)
 
     def _compact_dict(self) -> torch.Tensor:
-        # source_vocab: (vocab, d_model) → transpose to (d_model, vocab) → proj → (d_model, P) → T
-        return self.vocab_proj(
-            self.source_vocab.to(self.vocab_proj.weight.dtype).T
-        ).T  # (P, d_model)
+        return self.compact_dict  # (P, d_model), fixed
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # x: (B, L, C)

@@ -82,10 +82,10 @@ class DistillationLoss(nn.Module):
         )
 
         parts = {
-            "loss":    total.detach(),
-            "teach":   l_teach.detach(),
-            "stud":    l_stud.detach(),
-            "imit":    l_imit.detach(),
-            "guide":   l_guide.detach(),
+            "loss":  total.detach(),
+            "teach": l_teach.detach(),
+            "stud":  l_stud.detach(),
+            "imit":  l_imit.detach(),
+            "guide": l_guide.detach(),
         }
         return total, parts

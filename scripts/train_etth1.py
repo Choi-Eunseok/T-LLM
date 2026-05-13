@@ -1,18 +1,16 @@
 """
 T-LLM training script for ETTh1 long-term forecasting.
 
-Follows the experimental setup described in Section 4.2 and 4.3:
-  - Input length L = 96
-  - Prediction horizons T ∈ {96, 192, 336, 720}
-  - GPT-2 backbone (first 6 layers) with LoRA
-  - Adam, lr = 5e-4, batch size = 64
-  - L1 loss for ETT datasets
-  - Early stopping on teacher validation MSE
-  - Checkpoint selected by best teacher validation MSE
+Paper setup (Section 4.2 / 4.3):
+  - Input length L = 96, horizons T ∈ {96, 192, 336, 720}
+  - GPT-2 backbone (first 6 layers) + LoRA
+  - Adam lr = 5e-4, L1 loss (ETT)
+  - λ1=1.0 (imitation), λ2=0.01 (guidance), λ3=1.0 (student)
+  - Early stopping / checkpoint by teacher validation MSE convergence
 
 Usage:
     python scripts/train_etth1.py
-    python scripts/train_etth1.py --horizon 96 --epochs 20
+    python scripts/train_etth1.py --horizon 96
     python scripts/train_etth1.py --csv data/ETT-small/ETTh1.csv --device cuda
 """
 
@@ -154,10 +152,11 @@ def train_horizon(
     optimizer = torch.optim.Adam(trainable, lr=args.lr)
 
     # ---- training loop ----
-    best_teacher_mse  = float("inf")
-    best_state        = None
-    best_epoch        = 0
-    no_improve        = 0
+    best_teacher_mse = float("inf")
+    best_student_mse = float("inf")
+    best_state       = None
+    best_epoch       = 0
+    no_improve       = 0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -180,18 +179,20 @@ def train_horizon(
         print(
             f"[h={horizon:3d}] epoch {epoch:3d}/{args.epochs}  "
             f"train={train_loss/max(train_n,1):.4f}  "
-            f"teacher_val_mse={teacher_val_mse:.4f}  "
+            f"t_val={teacher_val_mse:.4f}  "
             f"val_mse={val_mse:.4f}  val_mae={val_mae:.4f}",
             flush=True,
         )
 
-        # checkpoint selection: best teacher validation MSE (Section 3.6)
+        # Checkpoint selection: best teacher val MSE (paper Section 3.6).
+        # "Early stopping determined by convergence of the temporal teacher."
         if epoch >= args.min_epochs and teacher_val_mse < best_teacher_mse:
             best_teacher_mse = teacher_val_mse
+            best_student_mse = val_mse
             best_epoch       = epoch
             best_state       = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             no_improve       = 0
-        else:
+        elif epoch >= args.min_epochs:
             no_improve += 1
 
         if args.patience > 0 and epoch >= args.min_epochs and no_improve >= args.patience:
@@ -222,6 +223,7 @@ def train_horizon(
         "horizon":          horizon,
         "best_epoch":       best_epoch,
         "best_teacher_mse": best_teacher_mse,
+        "best_student_mse": best_student_mse,
         "test_mse":         test_mse,
         "test_mae":         test_mae,
         "paper_mse":        paper.get("mse"),
@@ -238,12 +240,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--csv",            type=Path,   default=Path("data/ETT-small/ETTh1.csv"))
     p.add_argument("--horizon",        type=int,    nargs="+", default=[96, 192, 336, 720])
     p.add_argument("--context-length", type=int,    default=96)
-    p.add_argument("--epochs",         type=int,    default=20)
+    p.add_argument("--epochs",         type=int,    default=50)
     p.add_argument("--batch-size",     type=int,    default=64)
     p.add_argument("--lr",             type=float,  default=5e-4)
-    p.add_argument("--min-epochs",     type=int,    default=5,
+    p.add_argument("--min-epochs",     type=int,    default=10,
                    help="Minimum epochs before early stopping / checkpoint selection.")
-    p.add_argument("--patience",       type=int,    default=5,
+    p.add_argument("--patience",       type=int,    default=10,
                    help="Early-stop patience on teacher val MSE (0 = disabled).")
     p.add_argument("--seed",           type=int,    default=42)
     p.add_argument("--device",         choices=["auto", "cpu", "cuda", "mps"], default="auto")
