@@ -1,21 +1,11 @@
-from dataclasses import dataclass
-
 import torch
-from torch import nn
-from torch.nn import functional as F
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-@dataclass
-class DistillationLossConfig:
-    teacher_weight: float = 1.0
-    student_weight: float = 1.0
-    imitation_weight: float = 1.0
-    guidance_weight: float = 0.01
-    head_guidance_weight: float = 0.5
-    tail_guidance_weight: float = 0.5
+class GuidanceProjection(nn.Module):
+    """Projection head ψ used for intermediate feature guidance (Eq. 24)."""
 
-
-class ProjectionHead(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
@@ -30,46 +20,72 @@ class ProjectionHead(nn.Module):
 
 
 class DistillationLoss(nn.Module):
-    def __init__(self, d_model: int, config: DistillationLossConfig | None = None) -> None:
+    """
+    Total training loss (Eq. 21):
+
+        L = L_teach + λ1 * L_imit + λ2 * L_guide + λ3 * L_stud
+
+    where:
+        L_teach = L1(teacher_pred, y)
+        L_stud  = L1(student_pred, y)
+        L_imit  = L1(student_pred, teacher_pred.detach())
+        L_guide = Σ_{k∈K} ω_k · MSE(ψ_S(z_k), ψ_T(e_k).detach())
+
+    Guidance layers K = {early, late} with equal weights ω_k = 0.5.
+
+    Paper hyperparameters for ETT (long-term):
+        λ1=1.0, λ2=0.01, λ3=1.0   (Section 4.2)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        lambda_imit: float  = 1.0,
+        lambda_guide: float = 0.01,
+        lambda_stud: float  = 1.0,
+    ) -> None:
         super().__init__()
-        self.config = config or DistillationLossConfig()
-        self.student_projection = ProjectionHead(d_model)
-        self.teacher_projection = ProjectionHead(d_model)
+        self.lambda_imit  = lambda_imit
+        self.lambda_guide = lambda_guide
+        self.lambda_stud  = lambda_stud
+        self.student_proj = GuidanceProjection(d_model)
+        self.teacher_proj = GuidanceProjection(d_model)
 
-    def forward(self, outputs: dict[str, object], target: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        student_pred = outputs["student_pred"]
-        teacher_pred = outputs["teacher_pred"]
-        student_features = outputs["student_features"]
-        teacher_features = outputs["teacher_features"]
+    def forward(
+        self,
+        outputs: dict[str, object],
+        target: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        s_pred = outputs["student_pred"]
+        t_pred = outputs["teacher_pred"]
+        s_feat = outputs["student_features"]
+        t_feat = outputs["teacher_features"]
 
-        teacher_loss = F.l1_loss(teacher_pred, target)
-        student_loss = F.l1_loss(student_pred, target)
-        imitation_loss = F.l1_loss(student_pred, teacher_pred.detach())
+        l_teach = F.l1_loss(t_pred, target)
+        l_stud  = F.l1_loss(s_pred, target)
+        l_imit  = F.l1_loss(s_pred, t_pred.detach())
 
-        head_loss = F.mse_loss(
-            self.student_projection(student_features["head"]),
-            self.teacher_projection(teacher_features["head"].detach()),
-        )
-        tail_loss = F.mse_loss(
-            self.student_projection(student_features["tail"]),
-            self.teacher_projection(teacher_features["tail"].detach()),
-        )
-        guidance_loss = (
-            self.config.head_guidance_weight * head_loss
-            + self.config.tail_guidance_weight * tail_loss
+        # guidance at early and late layers (Eq. 24, K = {early, late})
+        l_guide = 0.5 * F.mse_loss(
+            self.student_proj(s_feat["early"]),
+            self.teacher_proj(t_feat["early"]).detach(),
+        ) + 0.5 * F.mse_loss(
+            self.student_proj(s_feat["late"]),
+            self.teacher_proj(t_feat["late"]).detach(),
         )
 
         total = (
-            self.config.teacher_weight * teacher_loss
-            + self.config.student_weight * student_loss
-            + self.config.imitation_weight * imitation_loss
-            + self.config.guidance_weight * guidance_loss
+            l_teach
+            + self.lambda_imit  * l_imit
+            + self.lambda_guide * l_guide
+            + self.lambda_stud  * l_stud
         )
+
         parts = {
-            "loss": total.detach(),
-            "teacher": teacher_loss.detach(),
-            "student": student_loss.detach(),
-            "imitation": imitation_loss.detach(),
-            "guidance": guidance_loss.detach(),
+            "loss":    total.detach(),
+            "teach":   l_teach.detach(),
+            "stud":    l_stud.detach(),
+            "imit":    l_imit.detach(),
+            "guide":   l_guide.detach(),
         }
         return total, parts
