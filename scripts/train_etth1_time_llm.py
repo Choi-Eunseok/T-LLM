@@ -1,13 +1,14 @@
 """
-Time-LLM training script for ETTh1 long-term forecasting.
+Time-LLM training script for ETTh1 — paper-faithful protocol.
 
-Paper setup (Jin et al., ICLR 2024):
-  - Input length L = 96, horizons T ∈ {96, 192, 336, 720}
-  - GPT-2 backbone (frozen, no LoRA)
+Paper ETTh1 setup (Jin et al., ICLR 2024):
+  - seq_len=512, horizons T ∈ {96, 192, 336, 720}
+  - GPT-2 backbone (frozen) + mapping_layer + Prompt-as-Prefix
   - patch_len=16, stride=8, d_model=32, n_heads=8
-  - Adam lr=1e-4, L1 loss (ETT), checkpoint by val MSE
+  - Adam lr=0.01, cosine annealing, batch=24, epochs=100
+  - L1 loss (ETT), checkpoint by val MSE
 
-Note: The original paper uses LLaMA-7B. This script uses GPT-2 for a
+Note: Paper reports results with LLaMA-7B. This script uses GPT-2 for a
 fair backbone-controlled comparison with T-LLM (also GPT-2 based).
 
 Paper ETTh1 results (Table 1, LLaMA-7B backbone):
@@ -15,11 +16,10 @@ Paper ETTh1 results (Table 1, LLaMA-7B backbone):
   h=192: MSE=0.448, MAE=0.448
   h=336: MSE=0.481, MAE=0.466
   h=720: MSE=0.461, MAE=0.462
+  avg:   MSE=0.449, MAE=0.450
 
 Usage:
-    python scripts/train_etth1_time_llm.py
-    python scripts/train_etth1_time_llm.py --horizon 96
-    python scripts/train_etth1_time_llm.py --csv data/ETT-small/ETTh1.csv --device cuda
+    python scripts/train_etth1_time_llm.py --device cuda --csv data/ETT-small/ETTh1.csv
 """
 
 import argparse
@@ -36,7 +36,6 @@ from time_llm import TimeLLM, TimeLLMConfig
 from t_llm.data import load_etth1
 
 
-# Paper Table 1 reference results (LLaMA-7B backbone)
 PAPER_ETTH1 = {
     96:  {"mse": 0.404, "mae": 0.422},
     192: {"mse": 0.448, "mae": 0.448},
@@ -95,7 +94,7 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
         pin_memory=(device.type == "cuda"),
         persistent_workers=(args.num_workers > 0),
     )
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, **loader_kw)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,  **loader_kw)
     val_loader   = DataLoader(val_set,   batch_size=args.batch_size, **loader_kw)
     test_loader  = DataLoader(test_set,  batch_size=args.batch_size, **loader_kw)
 
@@ -111,18 +110,23 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
         n_heads           = args.n_heads,
         dropout           = 0.1,
         n_text_prototypes = args.n_prototypes,
+        prompt_token_len  = args.prompt_token_len,
         gpt2_model_name   = "gpt2",
     )
     model = TimeLLM(cfg).to(device)
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable, lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=1e-6
+    )
 
-    total_params     = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in trainable)
+    total_p     = sum(p.numel() for p in model.parameters())
+    trainable_p = sum(p.numel() for p in trainable)
     print(
-        f"[h={horizon:3d}] params: total={total_params/1e6:.1f}M  "
-        f"trainable={trainable_params/1e6:.1f}M",
+        f"[h={horizon:3d}] params: total={total_p/1e6:.1f}M  "
+        f"trainable={trainable_p/1e6:.1f}M  "
+        f"num_patches={cfg.num_patches}",
         flush=True,
     )
 
@@ -145,13 +149,14 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
             optimizer.step()
             train_loss += loss.item() * x.size(0)
             train_n    += x.size(0)
+        scheduler.step()
 
         val_mse, val_mae = evaluate(model, val_loader, device)
-
         print(
             f"[h={horizon:3d}] epoch {epoch:3d}/{args.epochs}  "
             f"train={train_loss/max(train_n,1):.4f}  "
-            f"val_mse={val_mse:.4f}  val_mae={val_mae:.4f}",
+            f"val_mse={val_mse:.4f}  val_mae={val_mae:.4f}  "
+            f"lr={scheduler.get_last_lr()[0]:.2e}",
             flush=True,
         )
 
@@ -186,13 +191,13 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
         print(f"  Checkpoint saved to {ckpt_path}", flush=True)
 
     return {
-        "horizon":        horizon,
-        "best_epoch":     best_epoch,
-        "best_val_mse":   best_val_mse,
-        "test_mse":       test_mse,
-        "test_mae":       test_mae,
-        "paper_mse":      paper.get("mse"),
-        "paper_mae":      paper.get("mae"),
+        "horizon":      horizon,
+        "best_epoch":   best_epoch,
+        "best_val_mse": best_val_mse,
+        "test_mse":     test_mse,
+        "test_mae":     test_mae,
+        "paper_mse":    paper.get("mse"),
+        "paper_mae":    paper.get("mae"),
     }
 
 
@@ -201,30 +206,27 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train Time-LLM (GPT-2) on ETTh1.")
-    p.add_argument("--csv",            type=Path,  default=Path("data/ETT-small/ETTh1.csv"))
-    p.add_argument("--horizon",        type=int,   nargs="+", default=[96, 192, 336, 720])
-    p.add_argument("--context-length", type=int,   default=96)
-    p.add_argument("--epochs",         type=int,   default=50)
-    p.add_argument("--batch-size",     type=int,   default=64)
-    p.add_argument("--lr",             type=float, default=1e-4)
-    p.add_argument("--min-epochs",     type=int,   default=3)
-    p.add_argument("--patience",       type=int,   default=10)
-    p.add_argument("--seed",           type=int,   default=42)
-    p.add_argument("--device",         choices=["auto", "cpu", "cuda", "mps"], default="auto")
-    p.add_argument("--num-workers",    type=int,   default=2)
+    p = argparse.ArgumentParser(description="Train Time-LLM (paper-faithful, GPT-2) on ETTh1.")
+    p.add_argument("--csv",              type=Path,  default=Path("data/ETT-small/ETTh1.csv"))
+    p.add_argument("--horizon",          type=int,   nargs="+", default=[96, 192, 336, 720])
+    p.add_argument("--context-length",   type=int,   default=512,  help="Paper uses 512 for ETTh1.")
+    p.add_argument("--epochs",           type=int,   default=100)
+    p.add_argument("--batch-size",       type=int,   default=24)
+    p.add_argument("--lr",               type=float, default=0.01)
+    p.add_argument("--min-epochs",       type=int,   default=3)
+    p.add_argument("--patience",         type=int,   default=20)
+    p.add_argument("--seed",             type=int,   default=42)
+    p.add_argument("--device",           choices=["auto", "cpu", "cuda", "mps"], default="auto")
+    p.add_argument("--num-workers",      type=int,   default=2)
     # model hyperparameters
-    p.add_argument("--patch-len",      type=int,   default=16)
-    p.add_argument("--stride",         type=int,   default=8)
-    p.add_argument("--d-model",        type=int,   default=32,
-                   help="Patch embedding dimension (before reprogramming).")
-    p.add_argument("--n-heads",        type=int,   default=8,
-                   help="Number of attention heads in the reprogramming layer.")
-    p.add_argument("--n-prototypes",   type=int,   default=1000,
-                   help="Number of word embedding prototypes used as K/V.")
-    p.add_argument("--ckpt-dir",       type=str,   default="checkpoints",
-                   help="Directory to save per-horizon checkpoints. Empty string to skip.")
-    p.add_argument("--out",            type=Path,  default=Path("results/etth1_time_llm.json"))
+    p.add_argument("--patch-len",        type=int,   default=16)
+    p.add_argument("--stride",           type=int,   default=8)
+    p.add_argument("--d-model",          type=int,   default=32)
+    p.add_argument("--n-heads",          type=int,   default=8)
+    p.add_argument("--n-prototypes",     type=int,   default=1000)
+    p.add_argument("--prompt-token-len", type=int,   default=128)
+    p.add_argument("--ckpt-dir",         type=str,   default="checkpoints")
+    p.add_argument("--out",              type=Path,  default=Path("results/etth1_time_llm.json"))
     return p.parse_args()
 
 
@@ -252,25 +254,26 @@ def main() -> None:
     avg_mae = sum(r["test_mae"] for r in results) / len(results)
 
     payload = {
-        "model":          "Time-LLM (GPT-2 backbone)",
-        "dataset":        "ETTh1",
-        "context_length": args.context_length,
-        "horizons":       args.horizon,
-        "epochs":         args.epochs,
-        "lr":             args.lr,
-        "batch_size":     args.batch_size,
-        "patch_len":      args.patch_len,
-        "stride":         args.stride,
-        "d_model":        args.d_model,
-        "n_heads":        args.n_heads,
-        "n_prototypes":   args.n_prototypes,
-        "device":         str(device),
-        "results":        results,
+        "model":            "Time-LLM (GPT-2 backbone, paper-faithful)",
+        "dataset":          "ETTh1",
+        "context_length":   args.context_length,
+        "horizons":         args.horizon,
+        "epochs":           args.epochs,
+        "lr":               args.lr,
+        "batch_size":       args.batch_size,
+        "patch_len":        args.patch_len,
+        "stride":           args.stride,
+        "d_model":          args.d_model,
+        "n_heads":          args.n_heads,
+        "n_prototypes":     args.n_prototypes,
+        "prompt_token_len": args.prompt_token_len,
+        "device":           str(device),
+        "results":          results,
         "average": {
-            "test_mse":  avg_mse,
-            "test_mae":  avg_mae,
-            "paper_mse": PAPER_ETTH1_AVG["mse"],
-            "paper_mae": PAPER_ETTH1_AVG["mae"],
+            "test_mse":   avg_mse,
+            "test_mae":   avg_mae,
+            "paper_mse":  PAPER_ETTH1_AVG["mse"],
+            "paper_mae":  PAPER_ETTH1_AVG["mae"],
             "paper_note": "paper values use LLaMA-7B backbone",
         },
     }
@@ -278,10 +281,7 @@ def main() -> None:
     args.out.write_text(json.dumps(payload, indent=2))
     print(f"\nResults written to {args.out}", flush=True)
     print(f"Average  test_mse={avg_mse:.4f}  test_mae={avg_mae:.4f}", flush=True)
-    print(
-        f"Paper(LLaMA-7B)  mse={PAPER_ETTH1_AVG['mse']}  mae={PAPER_ETTH1_AVG['mae']}",
-        flush=True,
-    )
+    print(f"Paper(LLaMA-7B)  mse={PAPER_ETTH1_AVG['mse']}  mae={PAPER_ETTH1_AVG['mae']}", flush=True)
 
 
 if __name__ == "__main__":

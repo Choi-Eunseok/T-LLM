@@ -1,26 +1,20 @@
 """
 Time-LLM: Time Series Forecasting by Reprogramming Large Language Models
-Jin et al. (2024), ICLR 2024 — https://arxiv.org/abs/2310.01728
+Jin et al. (ICLR 2024) — https://arxiv.org/abs/2310.01728
 
-Architecture (GPT-2 backbone):
-  1. RevIN  — per-sample channel-wise normalization
-  2. Patching — sliding window → (B*C, num_patches, patch_len)
-  3. Patch Embedding — Linear(patch_len → d_model)
-  4. Reprogramming — cross-attention: Q=patches, K/V=word prototypes → d_llm space
-  5. Frozen GPT-2 — processes reprogrammed tokens
-  6. Output Projection — flatten + Linear → (B, T, C)
-  7. RevIN denormalize
-
-Only the patch embedding, reprogramming layer, and output projection are trained.
+Paper-faithful implementation with:
+  - Learnable mapping_layer for source token generation (Section 3.1)
+  - Prompt-as-Prefix with per-sample statistics (Section 3.2)
+  - seq_len=512, batch=24, epochs=100, lr=0.01 (paper ETTh1 protocol)
 """
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import GPT2Model
+from transformers import GPT2Model, GPT2Tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +23,7 @@ from transformers import GPT2Model
 
 @dataclass
 class TimeLLMConfig:
-    context_length:    int   = 96
+    context_length:    int   = 512   # paper uses 512 for ETTh1
     prediction_length: int   = 96
     channels:          int   = 7
 
@@ -38,15 +32,20 @@ class TimeLLMConfig:
 
     d_model:           int   = 32    # patch embedding dimension
     d_llm:             int   = 768   # GPT-2 hidden size
-    n_heads:           int   = 8     # reprogramming attention heads
+    n_heads:           int   = 8
     dropout:           float = 0.1
 
-    n_text_prototypes: int   = 1000  # word embedding prototypes for K/V
+    n_text_prototypes: int   = 1000  # K in mapping_layer
+    prompt_token_len:  int   = 128   # fixed max prompt length (left-padded)
     gpt2_model_name:   str   = "gpt2"
+
+    dataset_desc: str = (
+        "ETT (Electricity Transformer Temperature) dataset records the temperature "
+        "of electricity transformers and different types of electricity load."
+    )
 
     @property
     def num_patches(self) -> int:
-        # number of patches from a context of length context_length
         return (self.context_length - self.patch_len) // self.stride + 1
 
 
@@ -75,11 +74,7 @@ class RevIN(nn.Module):
 # ---------------------------------------------------------------------------
 
 class PatchEmbedding(nn.Module):
-    """
-    Slice each channel's history into overlapping patches and project to d_model.
-    Input : (B, L, C)
-    Output: (B*C, num_patches, d_model)
-    """
+    """(B, L, C) → (B*C, num_patches, d_model)"""
 
     def __init__(self, patch_len: int, stride: int, d_model: int, dropout: float) -> None:
         super().__init__()
@@ -91,11 +86,8 @@ class PatchEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
-        # treat each channel independently: (B, L, C) → (B*C, L)
         x = x.transpose(1, 2).reshape(B * C, L)
-        # unfold into patches: (B*C, num_patches, patch_len)
         x = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        # project each patch to d_model
         return self.drop(self.norm(self.proj(x)))
 
 
@@ -105,11 +97,11 @@ class PatchEmbedding(nn.Module):
 
 class ReprogrammingLayer(nn.Module):
     """
-    Multi-head cross-attention that maps patch embeddings (d_model) into
-    the LLM's representation space (d_llm) by attending over word prototypes.
+    Multi-head cross-attention mapping patches (d_model) into LLM space (d_llm)
+    by attending over learned source embeddings (K/V).
 
-    Q: patch embeddings  (B*C, num_patches, d_model) → projected to d_llm
-    K, V: word prototypes (n_proto, d_llm)            → projected within d_llm
+    Q: (B*C, num_patches, d_model) → projected to d_llm
+    K, V: source_embeddings (n_proto, d_llm)
     Output: (B*C, num_patches, d_llm)
     """
 
@@ -126,26 +118,20 @@ class ReprogrammingLayer(nn.Module):
         self.out_proj = nn.Linear(d_llm,   d_llm, bias=False)
         self.drop     = nn.Dropout(dropout)
 
-    def forward(self, patches: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
-        # patches:    (B*C, N, d_model)
-        # prototypes: (n_proto, d_llm)
+    def forward(self, patches: torch.Tensor, source_emb: torch.Tensor) -> torch.Tensor:
         BC, N, _ = patches.shape
-        P = prototypes.shape[0]
+        P = source_emb.shape[0]
 
-        Q = self.q_proj(patches)                                     # (BC, N, d_llm)
-        K = self.k_proj(prototypes).unsqueeze(0).expand(BC, -1, -1) # (BC, P, d_llm)
-        V = self.v_proj(prototypes).unsqueeze(0).expand(BC, -1, -1) # (BC, P, d_llm)
+        Q = self.q_proj(patches)
+        K = self.k_proj(source_emb).unsqueeze(0).expand(BC, -1, -1)
+        V = self.v_proj(source_emb).unsqueeze(0).expand(BC, -1, -1)
 
         def split_heads(t, seq):
             return t.view(BC, seq, self.n_heads, self.head_dim).transpose(1, 2)
 
-        Q = split_heads(Q, N)   # (BC, H, N, head_dim)
-        K = split_heads(K, P)   # (BC, H, P, head_dim)
-        V = split_heads(V, P)
-
-        attn = (Q @ K.transpose(-2, -1)) * self.scale               # (BC, H, N, P)
-        attn = self.drop(F.softmax(attn, dim=-1))
-        out  = (attn @ V).transpose(1, 2).reshape(BC, N, -1)        # (BC, N, d_llm)
+        Q, K, V = split_heads(Q, N), split_heads(K, P), split_heads(V, P)
+        attn = self.drop(F.softmax((Q @ K.transpose(-2, -1)) * self.scale, dim=-1))
+        out  = (attn @ V).transpose(1, 2).reshape(BC, N, -1)
         return self.out_proj(out)
 
 
@@ -158,10 +144,7 @@ class TimeLLM(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # RevIN
-        self.revin = RevIN(cfg.channels)
-
-        # Patch embedding
+        self.revin       = RevIN(cfg.channels)
         self.patch_embed = PatchEmbedding(cfg.patch_len, cfg.stride, cfg.d_model, cfg.dropout)
 
         # Frozen GPT-2 backbone
@@ -170,19 +153,105 @@ class TimeLLM(nn.Module):
             p.requires_grad = False
         self.gpt2 = gpt2
 
-        # Word prototypes: evenly-spaced rows from GPT-2 word embedding matrix
-        vocab_size = gpt2.wte.weight.size(0)
-        idx = torch.linspace(0, vocab_size - 1, steps=cfg.n_text_prototypes).round().long()
-        self.register_buffer("word_prototypes", gpt2.wte.weight[idx].detach().clone())
+        # Tokenizer for Prompt-as-Prefix
+        tokenizer = GPT2Tokenizer.from_pretrained(cfg.gpt2_model_name)
+        tokenizer.pad_token    = tokenizer.eos_token
+        tokenizer.padding_side = "left"   # pad left so patches always follow at the end
+        self.tokenizer = tokenizer
 
-        # Reprogramming layer
+        # Learnable mapping layer: projects word embedding matrix columns
+        # word_emb (d_llm, vocab) → mapping_layer → (d_llm, n_proto) → T → (n_proto, d_llm)
+        vocab_size = gpt2.wte.weight.size(0)
+        self.mapping_layer = nn.Linear(vocab_size, cfg.n_text_prototypes)
+
         self.reprogramming = ReprogrammingLayer(cfg.d_model, cfg.n_heads, cfg.d_llm, cfg.dropout)
 
-        # Output projection: flatten (num_patches * d_llm) → prediction_length
+        # Output projection: flatten patch outputs → prediction
         self.output_proj = nn.Sequential(
             nn.LayerNorm(cfg.num_patches * cfg.d_llm),
             nn.Linear(cfg.num_patches * cfg.d_llm, cfg.prediction_length),
         )
+
+    # ------------------------------------------------------------------
+    # Source embeddings via mapping_layer (Section 3.1)
+    # ------------------------------------------------------------------
+
+    def _source_embeddings(self) -> torch.Tensor:
+        """
+        Apply mapping_layer to the (transposed) word embedding matrix.
+        word_emb: (vocab, d_llm) → .T → (d_llm, vocab)
+        mapping_layer: Linear(vocab → n_proto) → (d_llm, n_proto)
+        .T → (n_proto, d_llm)
+        """
+        word_emb = self.gpt2.wte.weight                   # (vocab, d_llm)
+        return self.mapping_layer(word_emb.T).T            # (n_proto, d_llm)
+
+    # ------------------------------------------------------------------
+    # Prompt-as-Prefix (Section 3.2)
+    # ------------------------------------------------------------------
+
+    def _prompt_embeds(self, x: torch.Tensor, B: int, C: int) -> torch.Tensor:
+        """
+        Build per-sample prompts with dataset description + task info + statistics,
+        tokenize, embed via frozen GPT-2 wte, and expand over channels.
+
+        Returns: (B*C, prompt_token_len, d_llm)
+        """
+        L = x.shape[1]
+        x_cpu = x.detach().cpu()
+
+        # Per-sample statistics (mean over channels for conciseness)
+        min_v    = x_cpu.min(dim=1).values.mean(dim=-1)     # (B,)
+        max_v    = x_cpu.max(dim=1).values.mean(dim=-1)
+        median_v = x_cpu.median(dim=1).values.mean(dim=-1)
+
+        # Trend: compare last half vs first half mean
+        first_half = x_cpu[:, :L // 2, :].mean(dim=(1, 2))
+        last_half  = x_cpu[:, L // 2:, :].mean(dim=(1, 2))
+
+        # Top-5 frequency lags via FFT
+        fft_amp   = torch.fft.rfft(x_cpu.mean(dim=-1), dim=-1).abs()  # (B, L//2+1)
+        top5_lags = fft_amp[:, 1:].topk(5, dim=-1).indices + 1        # skip DC
+
+        prompts = []
+        for b in range(B):
+            trend = "upward" if last_half[b] > first_half[b] else "downward"
+            lags  = ", ".join(str(top5_lags[b, k].item()) for k in range(5))
+            prompt = (
+                f"<|start_prompt|>"
+                f"Dataset description: {self.cfg.dataset_desc} "
+                f"Task description: forecast the next {self.cfg.prediction_length} steps "
+                f"given the previous {self.cfg.context_length} steps. "
+                f"Input statistics: min value {min_v[b]:.3f}, "
+                f"max value {max_v[b]:.3f}, "
+                f"median value {median_v[b]:.3f}, "
+                f"the trend of input series is {trend}, "
+                f"top 5 lags are {lags}."
+                f"<|end_prompt|>"
+            )
+            prompts.append(prompt)
+
+        enc = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=self.cfg.prompt_token_len,
+            truncation=True,
+        ).to(x.device)
+
+        # Embed with frozen wte: (B, prompt_len, d_llm)
+        with torch.no_grad():
+            prompt_emb = self.gpt2.wte(enc.input_ids)
+
+        # Expand for channels: (B*C, prompt_len, d_llm)
+        return (prompt_emb
+                .unsqueeze(1)
+                .expand(-1, C, -1, -1)
+                .reshape(B * C, self.cfg.prompt_token_len, self.cfg.d_llm))
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
@@ -190,23 +259,33 @@ class TimeLLM(nn.Module):
         # 1. RevIN normalize
         x_norm, mean, std = self.revin.normalize(x)
 
-        # 2. Patch + embed: (B, L, C) → (B*C, num_patches, d_model)
+        # 2. Patch embed: (B*C, num_patches, d_model)
         patches = self.patch_embed(x_norm)
 
-        # 3. Reprogram into LLM space: (B*C, num_patches, d_llm)
-        reprogrammed = self.reprogramming(patches, self.word_prototypes)
+        # 3. Source embeddings via mapping_layer: (n_proto, d_llm)
+        source_emb = self._source_embeddings()
 
-        # 4. Frozen GPT-2
-        gpt_out = self.gpt2(
-            inputs_embeds=reprogrammed,
+        # 4. Reprogram patches into LLM space: (B*C, num_patches, d_llm)
+        reprogrammed = self.reprogramming(patches, source_emb)
+
+        # 5. Prompt-as-Prefix: (B*C, prompt_len, d_llm)
+        prompt_emb = self._prompt_embeds(x_norm, B, C)
+
+        # 6. Concat [prompt | patches] and run frozen GPT-2
+        input_emb = torch.cat([prompt_emb, reprogrammed], dim=1)
+        gpt_out   = self.gpt2(
+            inputs_embeds=input_emb,
             use_cache=False,
             return_dict=True,
-        ).last_hidden_state                                       # (B*C, num_patches, d_llm)
+        ).last_hidden_state                                      # (B*C, prompt+patches, d_llm)
 
-        # 5. Flatten + project: (B*C, num_patches * d_llm) → (B*C, T)
-        pred = self.output_proj(gpt_out.flatten(1))              # (B*C, T)
+        # 7. Take only patch positions (last num_patches tokens)
+        patch_out = gpt_out[:, -self.cfg.num_patches:, :]       # (B*C, num_patches, d_llm)
 
-        # 6. Reshape and denormalize: (B, T, C)
+        # 8. Flatten + project: (B*C, T)
+        pred = self.output_proj(patch_out.flatten(1))
+
+        # 9. Reshape + RevIN denormalize: (B, T, C)
         pred = pred.view(B, C, self.cfg.prediction_length).transpose(1, 2)
         return self.revin.denormalize(pred, mean, std)
 
