@@ -36,7 +36,7 @@ class TimeLLMConfig:
     dropout:           float = 0.1
 
     n_text_prototypes: int   = 1000  # K in mapping_layer
-    prompt_token_len:  int   = 128   # fixed max prompt length (left-padded)
+    prompt_token_len:  int   = 32    # fixed max prompt length (left-padded)
     gpt2_model_name:   str   = "gpt2"
 
     dataset_desc: str = (
