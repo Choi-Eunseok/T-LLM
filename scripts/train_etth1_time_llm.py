@@ -120,6 +120,8 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-6
     )
+    use_amp = (device.type == "cuda") and args.amp
+    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     total_p     = sum(p.numel() for p in model.parameters())
     trainable_p = sum(p.numel() for p in trainable)
@@ -142,11 +144,14 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad(set_to_none=True)
-            pred = model(x)
-            loss = nn.functional.l1_loss(pred, y)
-            loss.backward()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                pred = model(x)
+                loss = nn.functional.l1_loss(pred, y)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             train_loss += loss.item() * x.size(0)
             train_n    += x.size(0)
         scheduler.step()
@@ -225,6 +230,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-heads",          type=int,   default=8)
     p.add_argument("--n-prototypes",     type=int,   default=1000)
     p.add_argument("--prompt-token-len", type=int,   default=128)
+    p.add_argument("--amp",              action="store_true",
+                   help="Use automatic mixed precision (float16) on CUDA.")
     p.add_argument("--ckpt-dir",         type=str,   default="checkpoints")
     p.add_argument("--out",              type=Path,  default=Path("results/etth1_time_llm.json"))
     return p.parse_args()

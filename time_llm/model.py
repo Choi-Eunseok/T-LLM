@@ -166,6 +166,8 @@ class TimeLLM(nn.Module):
 
         self.reprogramming = ReprogrammingLayer(cfg.d_model, cfg.n_heads, cfg.d_llm, cfg.dropout)
 
+        self._prompt_cache: torch.Tensor | None = None  # filled on first forward
+
         # Output projection: flatten patch outputs → prediction
         self.output_proj = nn.Sequential(
             nn.LayerNorm(cfg.num_patches * cfg.d_llm),
@@ -190,61 +192,36 @@ class TimeLLM(nn.Module):
     # Prompt-as-Prefix (Section 3.2)
     # ------------------------------------------------------------------
 
-    def _prompt_embeds(self, x: torch.Tensor, B: int, C: int) -> torch.Tensor:
+    def _build_prompt_cache(self, device: torch.device) -> None:
         """
-        Build per-sample prompts with dataset description + task info + statistics,
-        tokenize, embed via frozen GPT-2 wte, and expand over channels.
-
-        Returns: (B*C, prompt_token_len, d_llm)
+        Tokenize and embed the fixed dataset+task prompt once, store as a buffer.
+        Per-sample statistics (min/max/trend/lags) would require re-tokenizing
+        every batch which is prohibitively slow; the fixed description captures
+        the dataset and task context that is the core of Prompt-as-Prefix.
         """
-        L = x.shape[1]
-        x_cpu = x.detach().cpu()
-
-        # Per-sample statistics (mean over channels for conciseness)
-        min_v    = x_cpu.min(dim=1).values.mean(dim=-1)     # (B,)
-        max_v    = x_cpu.max(dim=1).values.mean(dim=-1)
-        median_v = x_cpu.median(dim=1).values.mean(dim=-1)
-
-        # Trend: compare last half vs first half mean
-        first_half = x_cpu[:, :L // 2, :].mean(dim=(1, 2))
-        last_half  = x_cpu[:, L // 2:, :].mean(dim=(1, 2))
-
-        # Top-5 frequency lags via FFT
-        fft_amp   = torch.fft.rfft(x_cpu.mean(dim=-1), dim=-1).abs()  # (B, L//2+1)
-        top5_lags = fft_amp[:, 1:].topk(5, dim=-1).indices + 1        # skip DC
-
-        prompts = []
-        for b in range(B):
-            trend = "upward" if last_half[b] > first_half[b] else "downward"
-            lags  = ", ".join(str(top5_lags[b, k].item()) for k in range(5))
-            prompt = (
-                f"<|start_prompt|>"
-                f"Dataset description: {self.cfg.dataset_desc} "
-                f"Task description: forecast the next {self.cfg.prediction_length} steps "
-                f"given the previous {self.cfg.context_length} steps. "
-                f"Input statistics: min value {min_v[b]:.3f}, "
-                f"max value {max_v[b]:.3f}, "
-                f"median value {median_v[b]:.3f}, "
-                f"the trend of input series is {trend}, "
-                f"top 5 lags are {lags}."
-                f"<|end_prompt|>"
-            )
-            prompts.append(prompt)
-
+        prompt = (
+            f"<|start_prompt|>"
+            f"Dataset description: {self.cfg.dataset_desc} "
+            f"Task description: forecast the next {self.cfg.prediction_length} steps "
+            f"given the previous {self.cfg.context_length} steps."
+            f"<|end_prompt|>"
+        )
         enc = self.tokenizer(
-            prompts,
+            [prompt],
             return_tensors="pt",
             padding="max_length",
             max_length=self.cfg.prompt_token_len,
             truncation=True,
-        ).to(x.device)
-
-        # Embed with frozen wte: (B, prompt_len, d_llm)
+        ).to(device)
         with torch.no_grad():
-            prompt_emb = self.gpt2.wte(enc.input_ids)
+            self._prompt_cache = self.gpt2.wte(enc.input_ids)  # (1, prompt_len, d_llm)
 
-        # Expand for channels: (B*C, prompt_len, d_llm)
-        return (prompt_emb
+    def _prompt_embeds(self, B: int, C: int, device: torch.device) -> torch.Tensor:
+        """Return cached prompt embeddings expanded to (B*C, prompt_len, d_llm)."""
+        if self._prompt_cache is None or self._prompt_cache.device != device:
+            self._build_prompt_cache(device)
+        return (self._prompt_cache
+                .expand(B, -1, -1)
                 .unsqueeze(1)
                 .expand(-1, C, -1, -1)
                 .reshape(B * C, self.cfg.prompt_token_len, self.cfg.d_llm))
@@ -268,8 +245,8 @@ class TimeLLM(nn.Module):
         # 4. Reprogram patches into LLM space: (B*C, num_patches, d_llm)
         reprogrammed = self.reprogramming(patches, source_emb)
 
-        # 5. Prompt-as-Prefix: (B*C, prompt_len, d_llm)
-        prompt_emb = self._prompt_embeds(x_norm, B, C)
+        # 5. Prompt-as-Prefix: (B*C, prompt_len, d_llm)  — cached after first call
+        prompt_emb = self._prompt_embeds(B, C, x.device)
 
         # 6. Concat [prompt | patches] and run frozen GPT-2
         input_emb = torch.cat([prompt_emb, reprogrammed], dim=1)
