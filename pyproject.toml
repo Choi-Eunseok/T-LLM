@@ -14,5 +14,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
+[tool.setuptools]
+packages = ["t_llm", "time_llm"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,97 +1,126 @@
-# T-LLM
+# T-LLM vs Time-LLM — ETTh1 Benchmark
 
-PyTorch implementation scaffold for **T-LLM: Teaching Large Language Models to Forecast Time Series via Temporal Distillation**.
+PyTorch reimplementation of two LLM-based time series forecasting methods, evaluated on ETTh1 long-term forecasting.
 
-This repo implements the paper's main training idea:
+| Model | Backbone | h=96 | h=192 | h=336 | h=720 | Avg MSE |
+|-------|----------|------|-------|-------|-------|---------|
+| **T-LLM** (ours) | GPT-2 + LoRA | 0.3916 | 0.4496 | 0.4862 | 0.5148 | **0.4605** |
+| **Time-LLM** (ours) | GPT-2 frozen | 0.4060 | 0.4599 | 0.4895 | 0.5156 | 0.4678 |
+| T-LLM (paper) | GPT-2 + LoRA | 0.417 | 0.439 | 0.458 | 0.449 | 0.441 |
+| Time-LLM (paper) | LLaMA-7B | 0.404 | 0.448 | 0.481 | 0.461 | 0.449 |
 
-- shared time-series input block
-- training-only temporal teacher with DLinear-style trend modeling and FFT spectral modeling
-- student forecasting branch
-- reverse distillation losses: teacher supervision, student supervision, prediction imitation, and head/tail temporal guidance
-- inference through the student branch only
+> Paper results for Time-LLM use LLaMA-7B. Both our runs use GPT-2 for a fair backbone-controlled comparison.
 
-The default student is a compact Transformer so the project can run without downloading an LLM. The `TLLM` class keeps the student boundary isolated, so a frozen GPT-style backbone plus LoRA adapter can be added later without changing the teacher or loss code.
+---
+
+## Models
+
+### T-LLM
+**Paper**: [T-LLM: Teaching Large Language Models to Forecast Time Series via Temporal Distillation](https://arxiv.org/abs/2602.01937)
+
+Key components:
+- **Input Block**: channel embedding → channel self-attention (teacher tokens) → cross-attention with compact GPT-2 word dictionary (student tokens)
+- **Temporal Teacher**: 2-layer DLinear trend block + Adaptive Spectral Block + Trend-Periodic Fusion gate (training only)
+- **GPT-2 Student**: first 6 GPT-2 layers + LoRA (rank=8, alpha=16)
+- **Distillation Loss**: L = L_teach + 1.0·L_imit + 0.01·L_guide + 1.0·L_stud
+- **RevIN**: per-sample instance normalization
+
+Trainable params: ~10.4M (LoRA adapters + teacher + input block)
+
+### Time-LLM
+**Paper**: [Time-LLM: Time Series Forecasting by Reprogramming Large Language Models](https://arxiv.org/abs/2310.01728)
+
+Key components:
+- **Patch Embedding**: sliding window patches (patch_len=16, stride=8) → d_model=32
+- **Mapping Layer**: learnable projection over GPT-2 vocabulary → source embeddings (K/V)
+- **Reprogramming Layer**: multi-head cross-attention (Q=patches, K/V=source embeddings)
+- **Prompt-as-Prefix**: per-sample statistics (min/max/median/trend/top-5 lags) + dataset/task description prepended to LLM input
+- **Frozen GPT-2**: full 12-layer backbone, no gradient
+- **RevIN**: per-sample instance normalization
+
+Trainable params: ~56.8M (mapping_layer dominates at ~50M)
+
+---
 
 ## Install
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-## Quick Shape Check
+---
+
+## Training
+
+### T-LLM on ETTh1
 
 ```bash
-python scripts/smoke_train.py
+python scripts/train_etth1.py --device cuda --csv data/ETT-small/ETTh1.csv
 ```
 
-## ETTh1 Paper Protocol On CUDA / WSL
+Key arguments:
+```
+--horizon       96 192 336 720   (default: all four)
+--context-length 96              (paper default)
+--epochs        50
+--batch-size    64
+--lr            5e-4
+--min-epochs    3
+--patience      10
+--ckpt-dir      checkpoints
+--out           results/etth1.json
+```
 
-The paper's long-term ETTh1 setting uses an input length of 96 and prediction
-horizons of 96, 192, 336, and 720. The reproduction script downloads ETTh1 when
-`data/ETT-small/ETTh1.csv` is missing, trains the temporal teacher and GPT-2
-LoRA student together, and evaluates with the student branch only. In the GPT-2
-path, the input block builds the paper-style compact word-embedding dictionary
-from the frozen GPT-2 embeddings and uses cross attention to produce the LLM
-student tokens separately from the temporal teacher tokens.
-The default optimizer is Adam with learning rate `0.0005`, and the loss weights
-follow the paper's `lambda1=1.0` for prediction imitation, `lambda2=0.01` for
-temporal guidance, and `lambda3=1.0` for student supervision.
+### Time-LLM on ETTh1
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-python scripts/run_etth1_paper_protocol.py --device cuda --amp
+python scripts/train_etth1_time_llm.py --device cuda --csv data/ETT-small/ETTh1.csv
 ```
 
-For a quick CUDA smoke run before the full experiment:
-
-```bash
-python scripts/run_etth1_paper_protocol.py --device cuda --horizons 96 --epochs 1 --batch-size 16 --amp
+Key arguments:
+```
+--horizon         96 192 336 720   (default: all four)
+--context-length  512              (paper default)
+--epochs          100
+--batch-size      24
+--lr              0.01
+--patience        20
+--ckpt-dir        checkpoints
+--out             results/etth1_time_llm.json
 ```
 
-## Time-LLM Baseline
+ETTh1 data is downloaded automatically on first run of `train_etth1.py` if not found at `--csv`.
 
-To compare against a Time-LLM-style baseline, this repo includes a GPT-2 version
-of Time-LLM with patch embedding, Prompt-as-Prefix, source-token mapping, a
-reprogramming layer, and a frozen GPT-2 backbone. The official ETTh1 script uses
-`seq_len=512`, `patch_len=16`, `stride=8`, `d_model=32`, `d_ff=128`,
-`batch_size=24`, and horizon-specific learning rates.
+---
 
-```bash
-python scripts/run_etth1_time_llm.py --device cuda --amp --out results/etth1_time_llm.json
+## Results
+
+Results are saved as JSON to `results/`:
+- `results/etth1.json` — T-LLM per-horizon results
+- `results/etth1_time_llm.json` — Time-LLM per-horizon results
+
+---
+
+## Input / Output Format
+
+```
+Input:  [batch, context_length, channels]
+Output: [batch, prediction_length, channels]
 ```
 
-For a quick single-horizon check:
+---
 
-```bash
-python scripts/run_etth1_time_llm.py --device cuda --horizons 96 --epochs 1 --batch-size 8 --amp
+## Project Structure
+
 ```
-
-## Train On A CSV
-
-```bash
-python scripts/train_csv.py --csv path/to/data.csv --context-length 96 --prediction-length 96
-```
-
-To forecast only selected numeric columns:
-
-```bash
-python scripts/train_csv.py --csv path/to/data.csv --columns OT HUFL HULL
-```
-
-## Input Format
-
-Model input is a float tensor with shape:
-
-```text
-[batch, context_length, channels]
-```
-
-Forecast output is:
-
-```text
-[batch, prediction_length, channels]
+t_llm/          T-LLM package (config, data, layers, model, losses)
+time_llm/       Time-LLM package (config + model)
+scripts/
+  train_etth1.py            T-LLM training
+  train_etth1_time_llm.py   Time-LLM training
+data/ETT-small/ETTh1.csv    auto-downloaded
+results/                    JSON result files
+checkpoints/                saved model weights
 ```
