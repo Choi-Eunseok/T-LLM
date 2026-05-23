@@ -127,8 +127,9 @@ def load_trace(
           f"(최소 {min_len} 스텝 이상)")
 
     # split 로드 또는 생성
-    if split_file and Path(split_file).exists():
-        with open(split_file) as f:
+    split_path = Path(split_file) if split_file else None
+    if split_path and split_path.exists() and split_path.stat().st_size > 0:
+        with open(split_path) as f:
             splits = json.load(f)
         train_ids = [tuple(x) for x in splits["train"]]
         val_ids   = [tuple(x) for x in splits["val"]]
