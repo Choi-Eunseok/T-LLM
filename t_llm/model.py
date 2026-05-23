@@ -143,26 +143,58 @@ class GPT2LoRAStudent(nn.Module):
 
 class ClassificationHead(nn.Module):
     """
-    LLM 마지막 hidden state를 mean pooling 후 binary classification.
+    LLM pooled hidden state + 메모리 통계량을 결합해 binary classification.
 
-    Input : (B, d_model)  — job-level representation (채널 평균)
-    Output: (B,)          — raw logit (BCEWithLogitsLoss 사용)
+    Input:
+      pooled : (B, d_model)  — LLM last hidden state, mean-pooled over seq
+      stats  : (B, N_STATS)  — 메모리 직접 통계량 (아래 compute_stats 참고)
+    Output: (B,)             — raw logit (BCEWithLogitsLoss 사용)
 
-    시계열 ch1 출력 대신 별도 head를 두어 regression/classification 충돌 방지.
+    통계량을 직접 제공하는 이유:
+      LLM hidden state는 메모리 예측에 최적화돼 completion 신호가 약함.
+      메모리 level·trend·variance는 eviction과 직접 상관관계가 있음.
     """
+
+    N_STATS: int = 6   # compute_stats 반환 차원
 
     def __init__(self, d_model: int, dropout: float = 0.1) -> None:
         super().__init__()
+        in_dim = d_model + self.N_STATS
         self.net = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model // 4),
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, in_dim // 4),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 4, 1),
+            nn.Linear(in_dim // 4, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)   # (B,)
+    def forward(self, pooled: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([pooled, stats], dim=1)   # (B, d_model + N_STATS)
+        return self.net(x).squeeze(-1)           # (B,)
+
+    @staticmethod
+    def compute_stats(x_norm: torch.Tensor) -> torch.Tensor:
+        """
+        정규화된 입력에서 메모리 통계량 추출.
+
+        x_norm : (B, L, C)  — RevIN 정규화된 입력
+        returns: (B, 6)
+          [0] mean      — 평균 메모리 수준
+          [1] std       — 변동성 (높으면 불안정)
+          [2] trend     — 전체 추세 (last - first)
+          [3] late_trend— 후반 추세 (last - mid)  ← eviction 직전 패턴
+          [4] max       — 최대 메모리 (자원 압박 지표)
+          [5] range     — max - min  (변동 폭)
+        """
+        mem  = x_norm[:, :, 0]              # (B, L) memory channel
+        half = mem.shape[1] // 2
+        mean_v      = mem.mean(dim=1)
+        std_v       = mem.std(dim=1).clamp(min=1e-6)
+        trend       = mem[:, -1] - mem[:, 0]
+        late_trend  = mem[:, -1] - mem[:, half]
+        max_v       = mem.max(dim=1).values
+        range_v     = max_v - mem.min(dim=1).values
+        return torch.stack([mean_v, std_v, trend, late_trend, max_v, range_v], dim=1)
 
 
 # ---------------------------------------------------------------------------
@@ -196,15 +228,17 @@ class TLLM(nn.Module):
         # 분류 head (use_cls_head=True 일 때만 생성)
         self.cls_head = ClassificationHead(cfg.d_model, cfg.dropout) if cfg.use_cls_head else None
 
-    def _cls_logit(self, s_feat: dict, B: int) -> torch.Tensor:
+    def _cls_logit(self, s_feat: dict, x_norm: torch.Tensor) -> torch.Tensor:
         """
         InputBlock은 채널을 시퀀스 차원에 포함시키므로
         last_hidden_state shape = (B, seq_len, d_model).
-        → mean pool over seq_len → (B, d_model) → cls_head → (B,)
+        → mean pool over seq_len → (B, d_model)
+        + raw memory statistics → cls_head → (B,)
         """
-        late   = s_feat["late"]       # (B, seq_len, d_model)
-        pooled = late.mean(dim=1)     # (B, d_model)
-        return self.cls_head(pooled)  # (B,)
+        late   = s_feat["late"]                                    # (B, seq_len, d_model)
+        pooled = late.mean(dim=1)                                  # (B, d_model)
+        stats  = ClassificationHead.compute_stats(x_norm)          # (B, 6)
+        return self.cls_head(pooled, stats)                        # (B,)
 
     def forward(self, x: torch.Tensor, teacher: bool = True) -> dict[str, object]:
         B = x.size(0)
@@ -215,7 +249,7 @@ class TLLM(nn.Module):
         result: dict[str, object] = {"student_pred": s_pred, "student_features": s_feat}
 
         if self.cls_head is not None:
-            result["cls_logit"] = self._cls_logit(s_feat, B)    # (B,)
+            result["cls_logit"] = self._cls_logit(s_feat, x_norm)  # (B,)
 
         if teacher:
             t_pred_norm, t_feat = self.teacher(teacher_tokens)
@@ -241,7 +275,7 @@ class TLLM(nn.Module):
         x_norm, _, _ = self.revin.normalize(x)
         _, student_tokens = self.input(x_norm)
         _, s_feat = self.student(student_tokens)
-        return self._cls_logit(s_feat, x.size(0))
+        return self._cls_logit(s_feat, x_norm)
 
     @torch.no_grad()
     def predict_teacher(self, x: torch.Tensor) -> torch.Tensor:
