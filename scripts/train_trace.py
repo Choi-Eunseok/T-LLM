@@ -210,6 +210,8 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
     no_improve   = 0
     epoch_times  = []
     train_start  = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
@@ -277,22 +279,27 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             print(f"  Early stopping at epoch {epoch}.")
             break
 
-    total_train_sec = time.perf_counter() - train_start
-    avg_epoch_sec   = sum(epoch_times) / len(epoch_times)
+    total_train_sec  = time.perf_counter() - train_start
+    avg_epoch_sec    = sum(epoch_times) / len(epoch_times)
+    gpu_mem_train_mb = (torch.cuda.max_memory_allocated(device) / 1024**2
+                        if device.type == "cuda" else 0.0)
 
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # inference time
+    # inference time & memory
     if device.type == "cuda":
         torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(device)
     infer_start = time.perf_counter()
     test_metrics = evaluate(model, test_loader, criterion, device)
     if device.type == "cuda":
         torch.cuda.synchronize()
-    infer_sec = time.perf_counter() - infer_start
-    n_test    = len(test_loader.dataset)
+    infer_sec           = time.perf_counter() - infer_start
+    n_test              = len(test_loader.dataset)
     infer_ms_per_sample = infer_sec / n_test * 1000
+    gpu_mem_infer_mb    = (torch.cuda.max_memory_allocated(device) / 1024**2
+                           if device.type == "cuda" else 0.0)
 
     print(
         f"\n[Test]  mse={test_metrics['mse']:.4f}  mae={test_metrics['mae']:.4f}  "
@@ -302,7 +309,8 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
     print(
         f"  train_total={total_train_sec:.1f}s  "
         f"avg_epoch={avg_epoch_sec:.1f}s  "
-        f"infer={infer_ms_per_sample:.3f}ms/sample",
+        f"infer={infer_ms_per_sample:.3f}ms/sample  "
+        f"gpu_train={gpu_mem_train_mb:.0f}MB  gpu_infer={gpu_mem_infer_mb:.0f}MB",
     )
 
     if args.ckpt_dir:
@@ -319,6 +327,8 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         "train_total_sec":       round(total_train_sec, 2),
         "avg_epoch_sec":         round(avg_epoch_sec, 2),
         "infer_ms_per_sample":   round(infer_ms_per_sample, 4),
+        "gpu_mem_train_mb":      round(gpu_mem_train_mb, 1),
+        "gpu_mem_infer_mb":      round(gpu_mem_infer_mb, 1),
         **{f"test_{k}": v for k, v in test_metrics.items()},
     }
 
