@@ -17,6 +17,7 @@ ETTh1 비교용 체크포인트는 기존 train_etth1.py로 별도 생성.
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -207,8 +208,11 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
     best_state   = None
     best_epoch   = 0
     no_improve   = 0
+    epoch_times  = []
+    train_start  = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
         model.train()
         train_loss = train_n = 0
 
@@ -242,13 +246,17 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             train_loss += loss.item() * x.size(0)
             train_n    += x.size(0)
 
+        epoch_sec = time.perf_counter() - epoch_start
+        epoch_times.append(epoch_sec)
+
         val_metrics = evaluate(model, val_loader, criterion, device)
         print(
             f"epoch {epoch:3d}/{args.epochs}  "
             f"train={train_loss/max(train_n,1):.4f}  "
             f"val_mse={val_metrics['mse']:.4f}  val_mae={val_metrics['mae']:.4f}  "
             f"val_bce={val_metrics['bce']:.4f}  "
-            f"val_acc={val_metrics['acc']:.4f}  val_f1={val_metrics['f1']:.4f}",
+            f"val_acc={val_metrics['acc']:.4f}  val_f1={val_metrics['f1']:.4f}  "
+            f"({epoch_sec:.1f}s)",
             flush=True,
         )
 
@@ -269,14 +277,32 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             print(f"  Early stopping at epoch {epoch}.")
             break
 
+    total_train_sec = time.perf_counter() - train_start
+    avg_epoch_sec   = sum(epoch_times) / len(epoch_times)
+
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    # inference time
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    infer_start = time.perf_counter()
     test_metrics = evaluate(model, test_loader, criterion, device)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    infer_sec = time.perf_counter() - infer_start
+    n_test    = len(test_loader.dataset)
+    infer_ms_per_sample = infer_sec / n_test * 1000
+
     print(
         f"\n[Test]  mse={test_metrics['mse']:.4f}  mae={test_metrics['mae']:.4f}  "
         f"bce={test_metrics['bce']:.4f}  "
         f"acc={test_metrics['acc']:.4f}  f1={test_metrics['f1']:.4f}",
+    )
+    print(
+        f"  train_total={total_train_sec:.1f}s  "
+        f"avg_epoch={avg_epoch_sec:.1f}s  "
+        f"infer={infer_ms_per_sample:.3f}ms/sample",
     )
 
     if args.ckpt_dir:
@@ -287,9 +313,12 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         print(f"  Checkpoint: {ckpt_path}")
 
     return {
-        "best_epoch":   best_epoch,
-        "best_val_f1":  best_val_f1,
-        "best_val_mse": best_val_mse,
+        "best_epoch":            best_epoch,
+        "best_val_f1":           best_val_f1,
+        "best_val_mse":          best_val_mse,
+        "train_total_sec":       round(total_train_sec, 2),
+        "avg_epoch_sec":         round(avg_epoch_sec, 2),
+        "infer_ms_per_sample":   round(infer_ms_per_sample, 4),
         **{f"test_{k}": v for k, v in test_metrics.items()},
     }
 

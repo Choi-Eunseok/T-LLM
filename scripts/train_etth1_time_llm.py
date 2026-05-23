@@ -25,6 +25,7 @@ Usage:
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -137,8 +138,11 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
     best_state   = None
     best_epoch   = 0
     no_improve   = 0
+    epoch_times  = []
+    train_start  = time.perf_counter()
 
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
         model.train()
         train_loss = train_n = 0
         for x, y in train_loader:
@@ -156,12 +160,15 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
             train_n    += x.size(0)
         scheduler.step()
 
+        epoch_sec = time.perf_counter() - epoch_start
+        epoch_times.append(epoch_sec)
+
         val_mse, val_mae = evaluate(model, val_loader, device)
         print(
             f"[h={horizon:3d}] epoch {epoch:3d}/{args.epochs}  "
             f"train={train_loss/max(train_n,1):.4f}  "
             f"val_mse={val_mse:.4f}  val_mae={val_mae:.4f}  "
-            f"lr={scheduler.get_last_lr()[0]:.2e}",
+            f"lr={scheduler.get_last_lr()[0]:.2e}  ({epoch_sec:.1f}s)",
             flush=True,
         )
 
@@ -177,14 +184,33 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
             print(f"  Early stopping at epoch {epoch}.", flush=True)
             break
 
+    total_train_sec = time.perf_counter() - train_start
+    avg_epoch_sec   = sum(epoch_times) / len(epoch_times)
+
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    # inference time
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    infer_start = time.perf_counter()
     test_mse, test_mae = evaluate(model, test_loader, device)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    infer_sec = time.perf_counter() - infer_start
+    n_test    = len(test_loader.dataset)
+    infer_ms_per_sample = infer_sec / n_test * 1000
+
     paper = PAPER_ETTH1.get(horizon, {})
     print(
         f"[h={horizon:3d}] test_mse={test_mse:.4f}  test_mae={test_mae:.4f}  "
         f"(paper/LLaMA-7B: mse={paper.get('mse','?')} mae={paper.get('mae','?')})",
+        flush=True,
+    )
+    print(
+        f"  train_total={total_train_sec:.1f}s  "
+        f"avg_epoch={avg_epoch_sec:.1f}s  "
+        f"infer={infer_ms_per_sample:.3f}ms/sample",
         flush=True,
     )
 
@@ -196,13 +222,16 @@ def train_horizon(args: argparse.Namespace, horizon: int, device: torch.device) 
         print(f"  Checkpoint saved to {ckpt_path}", flush=True)
 
     return {
-        "horizon":      horizon,
-        "best_epoch":   best_epoch,
-        "best_val_mse": best_val_mse,
-        "test_mse":     test_mse,
-        "test_mae":     test_mae,
-        "paper_mse":    paper.get("mse"),
-        "paper_mae":    paper.get("mae"),
+        "horizon":             horizon,
+        "best_epoch":          best_epoch,
+        "best_val_mse":        best_val_mse,
+        "test_mse":            test_mse,
+        "test_mae":            test_mae,
+        "paper_mse":           paper.get("mse"),
+        "paper_mae":           paper.get("mae"),
+        "train_total_sec":     round(total_train_sec, 2),
+        "avg_epoch_sec":       round(avg_epoch_sec, 2),
+        "infer_ms_per_sample": round(infer_ms_per_sample, 4),
     }
 
 
