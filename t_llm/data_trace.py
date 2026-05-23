@@ -44,6 +44,8 @@ class TraceDataset(Dataset):
         prediction_length: int,
         scaler: StandardScaler,
         fit_scaler: bool = False,
+        late_ratio: float = 0.5,     # job 후반 몇 % 구간에서 윈도우 생성
+                                     # 0.0 = 전체, 0.5 = 후반 50%
     ) -> None:
         self.context_length    = context_length
         self.prediction_length = prediction_length
@@ -65,8 +67,12 @@ class TraceDataset(Dataset):
             total = context_length + prediction_length
             if len(ts) < total:
                 continue
-            for start in range(0, len(ts) - total + 1):
-                x = ts[start            : start + context_length]
+
+            # late_ratio > 0 이면 job 후반부에서만 윈도우 생성
+            # 종료 직전 패턴(완료 vs 중단)이 구별 가능한 구간
+            start_min = max(0, int(len(ts) * late_ratio) - context_length)
+            for start in range(start_min, len(ts) - total + 1):
+                x = ts[start                  : start + context_length]
                 y = ts[start + context_length : start + total]
                 self.samples.append((x, y))
 
@@ -100,6 +106,7 @@ def load_trace(
     val_ratio:   float = 0.1,
     seed: int = 42,
     split_file: str | Path | None = None,
+    late_ratio: float = 0.5,
 ) -> tuple[TraceDataset, TraceDataset, TraceDataset]:
     """
     CSV를 읽어 instance-level split 후 (train, val, test) 반환.
@@ -160,9 +167,12 @@ def load_trace(
 
     scaler = StandardScaler()
     train_set = TraceDataset(df, train_ids, context_length, prediction_length,
-                             scaler, fit_scaler=True)
-    val_set   = TraceDataset(df, val_ids,   context_length, prediction_length, scaler)
-    test_set  = TraceDataset(df, test_ids,  context_length, prediction_length, scaler)
+                             scaler, fit_scaler=True, late_ratio=late_ratio)
+    val_set   = TraceDataset(df, val_ids,   context_length, prediction_length,
+                             scaler, late_ratio=late_ratio)
+    test_set  = TraceDataset(df, test_ids,  context_length, prediction_length,
+                             scaler, late_ratio=late_ratio)
     print(f"  샘플 수 — train={len(train_set):,}  "
-          f"val={len(val_set):,}  test={len(test_set):,}")
+          f"val={len(val_set):,}  test={len(test_set):,}  "
+          f"(late_ratio={late_ratio})")
     return train_set, val_set, test_set

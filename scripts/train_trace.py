@@ -153,6 +153,7 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         val_ratio         = 0.1,
         seed              = args.seed,
         split_file        = args.split_file,
+        late_ratio        = args.late_ratio,
     )
     loader_kw = dict(
         num_workers       = args.num_workers,
@@ -368,6 +369,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out",            type=Path,  default=Path("results/trace.json"))
     p.add_argument("--noise-std",      type=float, default=0.0,
                    help="Gaussian noise σ added to teacher features during distillation. 0 = off.")
+    p.add_argument("--late-ratio",     type=float, default=0.5,
+                   help="job 후반 몇 %% 구간에서만 윈도우 생성 (0.0=전체, 0.5=후반50%%).")
     return p.parse_args()
 
 

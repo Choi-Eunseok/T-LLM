@@ -144,6 +144,7 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         val_ratio         = 0.1,
         seed              = args.seed,
         split_file        = args.split_file,
+        late_ratio        = args.late_ratio,
     )
     loader_kw = dict(
         num_workers        = args.num_workers,
@@ -326,6 +327,8 @@ def parse_args() -> argparse.Namespace:
                    help="BCE loss 가중치. MSE(~0.02) 대비 BCE(~0.5) 균형을 위해 기본값 5.0.")
     p.add_argument("--pos-weight",     type=float, default=2.0,
                    help="BCEWithLogitsLoss pos_weight (n_neg/n_pos). 클래스 불균형 보정.")
+    p.add_argument("--late-ratio",     type=float, default=0.5,
+                   help="job 후반 몇 %% 구간에서만 윈도우 생성 (0.0=전체, 0.5=후반50%%).")
     p.add_argument("--min-epochs",     type=int,   default=3)
     p.add_argument("--patience",       type=int,   default=10)
     p.add_argument("--seed",           type=int,   default=42)
