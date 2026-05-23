@@ -146,8 +146,13 @@ def load_trace(
         test_ids  = shuffled[n_train + n_val:]
         if split_file:
             Path(split_file).parent.mkdir(parents=True, exist_ok=True)
+            # numpy.int64 → Python int 변환 후 직렬화
+            def to_py(ids):
+                return [[int(c), int(i)] for c, i in ids]
             with open(split_file, "w") as f:
-                json.dump({"train": train_ids, "val": val_ids, "test": test_ids}, f)
+                json.dump({"train": to_py(train_ids),
+                           "val":   to_py(val_ids),
+                           "test":  to_py(test_ids)}, f)
             print(f"  split 저장: {split_file}")
 
     print(f"  train={len(train_ids)}  val={len(val_ids)}  test={len(test_ids)}")
