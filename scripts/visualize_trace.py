@@ -80,79 +80,137 @@ def plot_forecasts(
     out_path: Path,
     n_samples: int = 8,
 ) -> None:
-    """완료/미완료 각 n_samples//2 개씩 샘플링해서 예측 시각화."""
+    """
+    서로 다른 job에서 샘플을 뽑아 시각화.
+    각 샘플마다 두 개 subplot:
+      (위) 메모리 예측 — context / ground truth / prediction
+      (아래) 예측 완료 확률 시계열 — 0.5 threshold 표시
+    제목에 실제 결과 vs 예측 결과(정답/오답) 표시.
+    """
     model.eval()
     completed_samples, failed_samples = [], []
+    seen_fps: set = set()          # job fingerprint — 같은 job 중복 방지
 
     with torch.no_grad():
         for x, y in test_loader:
+            if (len(completed_samples) >= n_samples // 2 and
+                    len(failed_samples) >= n_samples // 2):
+                break
             x, y = x.to(device), y.to(device)
             pred = model.predict(x)
 
             for b in range(x.size(0)):
-                label = int(y[b, -1, 1].item())
+                ctx_np = x[b, :, 0].cpu().numpy()
+                # job fingerprint: 처음 5 스텝 값 (반올림)
+                fp = tuple(np.round(ctx_np[:5], 5))
+                if fp in seen_fps:
+                    continue
+                seen_fps.add(fp)
+
+                label       = int(y[b, -1, 1].item())
+                prob_series = torch.sigmoid(pred[b, :, 1]).cpu().numpy()  # (T,)
+                pred_label  = int(prob_series[-1] >= 0.5)
+                correct     = (pred_label == label)
+
                 sample = {
-                    "ctx":  x[b, :, 0].cpu().numpy(),
-                    "true": y[b, :, 0].cpu().numpy(),
-                    "pred": pred[b, :, 0].cpu().numpy(),
-                    "prob": torch.sigmoid(pred[b, -1, 1]).item(),
-                    "label": label,
+                    "ctx":        ctx_np,
+                    "true":       y[b, :, 0].cpu().numpy(),
+                    "pred_mem":   pred[b, :, 0].cpu().numpy(),
+                    "prob_series": prob_series,
+                    "label":      label,
+                    "pred_label": pred_label,
+                    "correct":    correct,
                 }
                 if label == 1 and len(completed_samples) < n_samples // 2:
                     completed_samples.append(sample)
                 elif label == 0 and len(failed_samples) < n_samples // 2:
                     failed_samples.append(sample)
 
-            if (len(completed_samples) >= n_samples // 2 and
-                    len(failed_samples) >= n_samples // 2):
-                break
-
     samples = completed_samples + failed_samples
     if not samples:
-        print("시각화할 샘플 없음")
+        print("No samples to visualize")
         return
 
-    n_cols = 4
-    n_rows = (len(samples) + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols,
-                             figsize=(n_cols * 5, n_rows * 3 + 0.5))
-    fig.suptitle("T-LLM — Google Cluster Trace Memory Forecast", fontsize=13, y=1.01)
-    axes = np.array(axes).flatten()
+    n_cols      = 4
+    n_sample_rows = (len(samples) + n_cols - 1) // n_cols
+    # 각 sample-row: 메모리(height 2) + 확률(height 1)
+    height_ratios = []
+    for _ in range(n_sample_rows):
+        height_ratios += [2, 1]
+
+    fig = plt.figure(figsize=(n_cols * 5, n_sample_rows * 4.5 + 0.5))
+    fig.suptitle("T-LLM — Google Cluster Trace Forecast", fontsize=13, y=1.005)
+    gs  = matplotlib.gridspec.GridSpec(
+        n_sample_rows * 2, n_cols,
+        height_ratios=height_ratios,
+        hspace=0.55, wspace=0.35,
+    )
 
     L = len(samples[0]["ctx"])
     T = len(samples[0]["true"])
+    x_ctx  = np.arange(L)
+    x_fore = np.arange(L, L + T)
 
     for i, s in enumerate(samples):
-        ax = axes[i]
-        # 역정규화
+        row_grp = i // n_cols
+        col     = i  % n_cols
+        ax_mem  = fig.add_subplot(gs[row_grp * 2,     col])
+        ax_prob = fig.add_subplot(gs[row_grp * 2 + 1, col])
+
+        # ── 메모리 역정규화 ──────────────────────────────
         ctx  = scaler.inverse_transform(s["ctx"].reshape(-1, 1)).flatten()
         true = scaler.inverse_transform(s["true"].reshape(-1, 1)).flatten()
-        pred = scaler.inverse_transform(s["pred"].reshape(-1, 1)).flatten()
+        pred = scaler.inverse_transform(s["pred_mem"].reshape(-1, 1)).flatten()
 
-        x_ctx  = np.arange(L)
-        x_fore = np.arange(L, L + T)
+        ax_mem.plot(x_ctx,  ctx,  color="steelblue", lw=1.2, label="context")
+        ax_mem.plot(x_fore, true, color="gray",      lw=1.2, ls="--", label="ground truth")
+        ax_mem.plot(x_fore, pred, color="tomato",    lw=1.5, label="prediction")
+        ax_mem.axvline(L, color="black", lw=0.7, ls=":")
 
-        ax.plot(x_ctx,  ctx,  color="steelblue", lw=1.2, label="context")
-        ax.plot(x_fore, true, color="gray",       lw=1.2, ls="--", label="ground truth")
-        ax.plot(x_fore, pred, color="tomato",     lw=1.5, label="prediction")
-        ax.axvline(L, color="black", lw=0.8, ls=":")
+        # 실제 결과 마커 (예측 구간 마지막 점)
+        end_x = L + T - 1
+        if s["label"] == 1:
+            ax_mem.scatter(end_x, true[-1], marker="*", color="green",
+                           s=80, zorder=5, label="actual: completed")
+        else:
+            ax_mem.scatter(end_x, true[-1], marker="X", color="red",
+                           s=80, zorder=5, label="actual: evicted")
 
-        status = "Completed" if s["label"] == 1 else "Evicted/Killed"
-        color  = "green"    if s["label"] == 1 else "red"
-        ax.set_title(
-            f"{status}  |  Completion prob: {s['prob']:.2f}",
-            fontsize=8, color=color,
+        # 예측 결과 마커
+        pred_marker = "^" if s["pred_label"] == 1 else "v"
+        pred_color  = "limegreen" if s["pred_label"] == 1 else "salmon"
+        ax_mem.scatter(end_x, pred[-1], marker=pred_marker,
+                       color=pred_color, s=60, zorder=5,
+                       label=f"pred: {'completed' if s['pred_label']==1 else 'evicted'}")
+
+        actual_str = "Completed" if s["label"] == 1 else "Evicted"
+        pred_str   = "Completed" if s["pred_label"] == 1 else "Evicted"
+        result_str = "✓ correct" if s["correct"] else "✗ wrong"
+        title_color = "green" if s["correct"] else "crimson"
+        ax_mem.set_title(
+            f"Actual: {actual_str}  |  Pred: {pred_str}  {result_str}",
+            fontsize=7.5, color=title_color,
         )
-        ax.set_xlabel("time step (5 min)", fontsize=7)
-        ax.set_ylabel("memory", fontsize=7)
-        ax.tick_params(labelsize=7)
+        ax_mem.set_ylabel("memory", fontsize=7)
+        ax_mem.tick_params(labelsize=6)
         if i == 0:
-            ax.legend(fontsize=6)
+            ax_mem.legend(fontsize=5.5, loc="upper left")
 
-    for j in range(len(samples), len(axes)):
-        axes[j].set_visible(False)
+        # ── 완료 확률 시계열 ─────────────────────────────
+        prob = s["prob_series"]
+        ax_prob.plot(x_fore, prob, color="darkorange", lw=1.5)
+        ax_prob.fill_between(x_fore, prob, 0.5,
+                             where=(prob >= 0.5), alpha=0.25, color="green",
+                             label="pred: completed")
+        ax_prob.fill_between(x_fore, prob, 0.5,
+                             where=(prob <  0.5), alpha=0.25, color="red",
+                             label="pred: evicted")
+        ax_prob.axhline(0.5, color="gray", lw=0.8, ls="--")
+        ax_prob.set_ylim(0, 1)
+        ax_prob.set_xlabel("time step (5 min)", fontsize=7)
+        ax_prob.set_ylabel("comp. prob", fontsize=7)
+        ax_prob.tick_params(labelsize=6)
 
-    plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
