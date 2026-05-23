@@ -116,7 +116,7 @@ def plot_forecasts(
     n_rows = (len(samples) + n_cols - 1) // n_cols
     fig, axes = plt.subplots(n_rows, n_cols,
                              figsize=(n_cols * 5, n_rows * 3 + 0.5))
-    fig.suptitle("T-LLM — Google Cluster Trace Memory 예측", fontsize=13, y=1.01)
+    fig.suptitle("T-LLM — Google Cluster Trace Memory Forecast", fontsize=13, y=1.01)
     axes = np.array(axes).flatten()
 
     L = len(samples[0]["ctx"])
@@ -137,13 +137,13 @@ def plot_forecasts(
         ax.plot(x_fore, pred, color="tomato",     lw=1.5, label="prediction")
         ax.axvline(L, color="black", lw=0.8, ls=":")
 
-        status = "✓ 완료" if s["label"] == 1 else "✗ 중단"
-        color  = "green"  if s["label"] == 1 else "red"
+        status = "Completed" if s["label"] == 1 else "Evicted/Killed"
+        color  = "green"    if s["label"] == 1 else "red"
         ax.set_title(
-            f"{status}  |  예측 완료 확률: {s['prob']:.2f}",
+            f"{status}  |  Completion prob: {s['prob']:.2f}",
             fontsize=8, color=color,
         )
-        ax.set_xlabel("time step (5min)", fontsize=7)
+        ax.set_xlabel("time step (5 min)", fontsize=7)
         ax.set_ylabel("memory", fontsize=7)
         ax.tick_params(labelsize=7)
         if i == 0:
@@ -182,7 +182,7 @@ def plot_cls_result(
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     fig.suptitle(
-        f"T-LLM 작업 완료 예측 성능  |  ACC={acc:.3f}  AUC={roc_auc:.3f}",
+        f"T-LLM Job Completion Prediction  |  ACC={acc:.3f}  AUC={roc_auc:.3f}",
         fontsize=12,
     )
 
@@ -199,7 +199,7 @@ def plot_cls_result(
     # 혼동행렬
     disp = ConfusionMatrixDisplay(
         confusion_matrix=cm,
-        display_labels=["중단 (0)", "완료 (1)"],
+        display_labels=["Evicted (0)", "Completed (1)"],
     )
     disp.plot(ax=axes[1], colorbar=False, cmap="Blues")
     axes[1].set_title("Confusion Matrix")
@@ -210,9 +210,9 @@ def plot_cls_result(
     plt.close(fig)
     print(f"저장: {out_path}")
 
-    print("\n[분류 리포트]")
+    print("\n[Classification Report]")
     print(classification_report(cls_true, pred_label,
-                                target_names=["중단(0)", "완료(1)"]))
+                                target_names=["Evicted(0)", "Completed(1)"]))
 
 
 # ---------------------------------------------------------------------------

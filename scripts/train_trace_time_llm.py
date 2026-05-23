@@ -58,10 +58,12 @@ class MultiTaskLoss(nn.Module):
     ch 1 → BCE  (completion classification)
     total = mse + lambda_cls * bce
     """
-    def __init__(self, lambda_cls: float = 1.0) -> None:
+    def __init__(self, lambda_cls: float = 1.0, pos_weight: float = 2.0) -> None:
         super().__init__()
         self.lambda_cls = lambda_cls
-        self.bce = nn.BCEWithLogitsLoss()
+        self.bce = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight])
+        )
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -88,7 +90,7 @@ def evaluate(
     device: torch.device,
 ) -> dict:
     model.eval()
-    mse_sum = bce_sum = n = 0.0
+    mse_sum = mae_sum = bce_sum = n = 0.0
     tp = fp = tn = fn = 0
 
     for x, y in loader:
@@ -96,8 +98,10 @@ def evaluate(
         pred = model(x)                         # (B, T, 2)
 
         mse = nn.functional.mse_loss(pred[:, :, 0], y[:, :, 0]).item()
+        mae = nn.functional.l1_loss(pred[:, :, 0],  y[:, :, 0]).item()
         bce = criterion.bce(pred[:, :, 1], y[:, :, 1]).item()
         mse_sum += mse * x.size(0)
+        mae_sum += mae * x.size(0)
         bce_sum += bce * x.size(0)
         n       += x.size(0)
 
@@ -116,6 +120,7 @@ def evaluate(
     f1   = 2 * prec * rec / max(prec + rec, 1e-8)
     return {
         "mse": mse_sum / max(n, 1),
+        "mae": mae_sum / max(n, 1),
         "bce": bce_sum / max(n, 1),
         "acc": acc,
         "f1":  f1,
@@ -169,7 +174,11 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         ),
     )
     model     = TimeLLM(cfg).to(device)
-    criterion = MultiTaskLoss(lambda_cls=args.lambda_cls)
+    criterion = MultiTaskLoss(lambda_cls=args.lambda_cls,
+                              pos_weight=args.pos_weight)
+    criterion.bce = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([args.pos_weight], device=device)
+    )
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable, lr=args.lr)
@@ -214,10 +223,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         print(
             f"epoch {epoch:3d}/{args.epochs}  "
             f"train={train_loss/max(train_n,1):.4f}  "
-            f"val_mse={val_metrics['mse']:.4f}  "
+            f"val_mse={val_metrics['mse']:.4f}  val_mae={val_metrics['mae']:.4f}  "
             f"val_bce={val_metrics['bce']:.4f}  "
-            f"val_acc={val_metrics['acc']:.4f}  "
-            f"val_f1={val_metrics['f1']:.4f}",
+            f"val_acc={val_metrics['acc']:.4f}  val_f1={val_metrics['f1']:.4f}",
             flush=True,
         )
 
@@ -243,10 +251,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
 
     test_metrics = evaluate(model, test_loader, criterion, device)
     print(
-        f"\n[Test]  mse={test_metrics['mse']:.4f}  "
+        f"\n[Test]  mse={test_metrics['mse']:.4f}  mae={test_metrics['mae']:.4f}  "
         f"bce={test_metrics['bce']:.4f}  "
-        f"acc={test_metrics['acc']:.4f}  "
-        f"f1={test_metrics['f1']:.4f}",
+        f"acc={test_metrics['acc']:.4f}  f1={test_metrics['f1']:.4f}",
     )
 
     if args.ckpt_dir:
@@ -276,8 +283,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs",         type=int,   default=50)
     p.add_argument("--batch-size",     type=int,   default=64)
     p.add_argument("--lr",             type=float, default=1e-4)
-    p.add_argument("--lambda-cls",     type=float, default=1.0,
-                   help="BCE loss 가중치.")
+    p.add_argument("--lambda-cls",     type=float, default=5.0,
+                   help="BCE loss 가중치. MSE(~0.02) 대비 BCE(~0.5) 균형을 위해 기본값 5.0.")
+    p.add_argument("--pos-weight",     type=float, default=2.0,
+                   help="BCEWithLogitsLoss pos_weight (n_neg/n_pos). 클래스 불균형 보정.")
     p.add_argument("--min-epochs",     type=int,   default=3)
     p.add_argument("--patience",       type=int,   default=10)
     p.add_argument("--seed",           type=int,   default=42)

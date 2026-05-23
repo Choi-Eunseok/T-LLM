@@ -57,11 +57,18 @@ class MultiTaskLoss(nn.Module):
     ch 0 → MSE  (memory regression)
     ch 1 → BCE  (completion classification)
     total = mse + lambda_cls * bce
+
+    pos_weight: 클래스 불균형 보정.
+      슬라이딩 윈도우 후 중단(0) 작업이 완료(1)보다 많아지는 경향이 있으므로
+      pos_weight = n_neg / n_pos 로 설정하면 균형이 맞춰짐.
+      기본값 2.0은 중단:완료 ≈ 2:1 비율을 가정.
     """
-    def __init__(self, lambda_cls: float = 1.0) -> None:
+    def __init__(self, lambda_cls: float = 1.0, pos_weight: float = 2.0) -> None:
         super().__init__()
         self.lambda_cls = lambda_cls
-        self.bce = nn.BCEWithLogitsLoss()
+        self.bce = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor([pos_weight])
+        )
 
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor
@@ -88,7 +95,7 @@ def evaluate(
     device: torch.device,
 ) -> dict:
     model.eval()
-    mse_sum = bce_sum = n = 0.0
+    mse_sum = mae_sum = bce_sum = n = 0.0
     tp = fp = tn = fn = 0
 
     for x, y in loader:
@@ -96,8 +103,10 @@ def evaluate(
         pred = model.predict(x)
 
         mse = nn.functional.mse_loss(pred[:, :, 0], y[:, :, 0]).item()
+        mae = nn.functional.l1_loss(pred[:, :, 0],  y[:, :, 0]).item()
         bce = criterion.bce(pred[:, :, 1], y[:, :, 1]).item()
         mse_sum += mse * x.size(0)
+        mae_sum += mae * x.size(0)
         bce_sum += bce * x.size(0)
         n       += x.size(0)
 
@@ -116,6 +125,7 @@ def evaluate(
     f1   = 2 * prec * rec / max(prec + rec, 1e-8)
     return {
         "mse": mse_sum / max(n, 1),
+        "mae": mae_sum / max(n, 1),
         "bce": bce_sum / max(n, 1),
         "acc": acc,
         "f1":  f1,
@@ -166,7 +176,11 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         dictionary_size   = 1024,
     )
     model     = TLLM(cfg).to(device)
-    criterion = MultiTaskLoss(lambda_cls=args.lambda_cls)
+    criterion = MultiTaskLoss(lambda_cls=args.lambda_cls,
+                              pos_weight=args.pos_weight)
+    criterion.bce = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([args.pos_weight], device=device)
+    )
 
     # distillation loss (teacher branch)
     from t_llm import DistillationLoss
@@ -202,11 +216,22 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            # T-LLM distillation forward
             outputs = model(x, teacher=True)
-            dist_loss, _ = distill(outputs, y)
 
-            # multi-task loss on student output
+            # Distillation loss on ch0 (memory) ONLY.
+            # Applying L1-based L_stud/L_teach to ch1 (binary label) conflicts
+            # with BCE and causes the classification head to collapse to the
+            # label mean.  Feature guidance (L_guide) is kept as-is since it
+            # operates on joint LLM features, not per-channel predictions.
+            outputs_mem = {
+                "student_pred":     outputs["student_pred"][:, :, 0:1],
+                "teacher_pred":     outputs["teacher_pred"][:, :, 0:1],
+                "student_features": outputs["student_features"],
+                "teacher_features": outputs["teacher_features"],
+            }
+            dist_loss, _ = distill(outputs_mem, y[:, :, 0:1])
+
+            # Multi-task loss: MSE(ch0) + BCE(ch1)
             mt_loss, _ = criterion(outputs["student_pred"], y)
 
             loss = dist_loss + mt_loss
@@ -221,10 +246,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         print(
             f"epoch {epoch:3d}/{args.epochs}  "
             f"train={train_loss/max(train_n,1):.4f}  "
-            f"val_mse={val_metrics['mse']:.4f}  "
+            f"val_mse={val_metrics['mse']:.4f}  val_mae={val_metrics['mae']:.4f}  "
             f"val_bce={val_metrics['bce']:.4f}  "
-            f"val_acc={val_metrics['acc']:.4f}  "
-            f"val_f1={val_metrics['f1']:.4f}",
+            f"val_acc={val_metrics['acc']:.4f}  val_f1={val_metrics['f1']:.4f}",
             flush=True,
         )
 
@@ -250,10 +274,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
 
     test_metrics = evaluate(model, test_loader, criterion, device)
     print(
-        f"\n[Test]  mse={test_metrics['mse']:.4f}  "
+        f"\n[Test]  mse={test_metrics['mse']:.4f}  mae={test_metrics['mae']:.4f}  "
         f"bce={test_metrics['bce']:.4f}  "
-        f"acc={test_metrics['acc']:.4f}  "
-        f"f1={test_metrics['f1']:.4f}",
+        f"acc={test_metrics['acc']:.4f}  f1={test_metrics['f1']:.4f}",
     )
 
     if args.ckpt_dir:
@@ -283,8 +306,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs",         type=int,   default=50)
     p.add_argument("--batch-size",     type=int,   default=64)
     p.add_argument("--lr",             type=float, default=5e-4)
-    p.add_argument("--lambda-cls",     type=float, default=1.0,
-                   help="BCE loss 가중치.")
+    p.add_argument("--lambda-cls",     type=float, default=5.0,
+                   help="BCE loss 가중치. MSE(~0.02) 대비 BCE(~0.5) 균형을 위해 기본값 5.0.")
+    p.add_argument("--pos-weight",     type=float, default=2.0,
+                   help="BCEWithLogitsLoss pos_weight (n_neg/n_pos). 클래스 불균형 보정.")
     p.add_argument("--min-epochs",     type=int,   default=3)
     p.add_argument("--patience",       type=int,   default=10)
     p.add_argument("--seed",           type=int,   default=42)
