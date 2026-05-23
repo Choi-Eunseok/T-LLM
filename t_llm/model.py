@@ -138,6 +138,34 @@ class GPT2LoRAStudent(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Classification Head (multi-task 전용, Section 3.5 확장)
+# ---------------------------------------------------------------------------
+
+class ClassificationHead(nn.Module):
+    """
+    LLM 마지막 hidden state를 mean pooling 후 binary classification.
+
+    Input : (B, d_model)  — job-level representation (채널 평균)
+    Output: (B,)          — raw logit (BCEWithLogitsLoss 사용)
+
+    시계열 ch1 출력 대신 별도 head를 두어 regression/classification 충돌 방지.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model // 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 4, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)   # (B,)
+
+
+# ---------------------------------------------------------------------------
 # T-LLM  (Section 3.2)
 # ---------------------------------------------------------------------------
 
@@ -146,7 +174,8 @@ class TLLM(nn.Module):
     Full T-LLM model combining InputBlock, TemporalTeacher, and GPT2LoRAStudent.
 
     Training:  forward(x, teacher=True)  → returns teacher + student outputs
-    Inference: predict(x)                → student prediction only
+    Inference: predict(x)                → student prediction only (ch0 memory)
+               predict_cls(x)            → cls_logit (use_cls_head=True 시)
     """
 
     def __init__(self, cfg: TLLMConfig) -> None:
@@ -164,12 +193,32 @@ class TLLM(nn.Module):
         )
         self.teacher = TemporalTeacher(cfg)
 
+        # 분류 head (use_cls_head=True 일 때만 생성)
+        self.cls_head = ClassificationHead(cfg.d_model, cfg.dropout) if cfg.use_cls_head else None
+
+    def _cls_logit(self, s_feat: dict, B: int) -> torch.Tensor:
+        """
+        student last hidden state (B*C, seq_len, d_model)
+        → mean pool over seq_len → (B*C, d_model)
+        → reshape (B, C, d_model) → mean over C → (B, d_model)
+        → cls_head → (B,)
+        """
+        late = s_feat["late"]                                    # (B*C, seq_len, d_model)
+        pooled = late.mean(dim=1)                                # (B*C, d_model)
+        pooled = pooled.view(B, self.cfg.channels, self.cfg.d_model).mean(dim=1)  # (B, d_model)
+        return self.cls_head(pooled)                             # (B,)
+
     def forward(self, x: torch.Tensor, teacher: bool = True) -> dict[str, object]:
+        B = x.size(0)
         x_norm, mean, std = self.revin.normalize(x)
         teacher_tokens, student_tokens = self.input(x_norm)
         s_pred_norm, s_feat = self.student(student_tokens)
         s_pred = self.revin.denormalize(s_pred_norm, mean, std)
         result: dict[str, object] = {"student_pred": s_pred, "student_features": s_feat}
+
+        if self.cls_head is not None:
+            result["cls_logit"] = self._cls_logit(s_feat, B)    # (B,)
+
         if teacher:
             t_pred_norm, t_feat = self.teacher(teacher_tokens)
             t_pred = self.revin.denormalize(t_pred_norm, mean, std)
@@ -179,11 +228,22 @@ class TLLM(nn.Module):
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """메모리 예측 (ch0). ETTh1 및 Trace 공용."""
         self.eval()
         x_norm, mean, std = self.revin.normalize(x)
         _, student_tokens = self.input(x_norm)
         pred_norm, _ = self.student(student_tokens)
         return self.revin.denormalize(pred_norm, mean, std)
+
+    @torch.no_grad()
+    def predict_cls(self, x: torch.Tensor) -> torch.Tensor:
+        """분류 logit 반환 (use_cls_head=True 전용). shape: (B,)"""
+        assert self.cls_head is not None, "use_cls_head=False 로 생성된 모델"
+        self.eval()
+        x_norm, _, _ = self.revin.normalize(x)
+        _, student_tokens = self.input(x_norm)
+        _, s_feat = self.student(student_tokens)
+        return self._cls_logit(s_feat, x.size(0))
 
     @torch.no_grad()
     def predict_teacher(self, x: torch.Tensor) -> torch.Tensor:

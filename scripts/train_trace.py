@@ -55,14 +55,10 @@ def get_device(choice: str) -> torch.device:
 
 class MultiTaskLoss(nn.Module):
     """
-    ch 0 → MSE  (memory regression)
-    ch 1 → BCE  (completion classification)
-    total = mse + lambda_cls * bce
+    memory (ch0) → MSE
+    completion   → BCE  (cls_head logit 사용, ch1 시계열 출력 대신)
 
-    pos_weight: 클래스 불균형 보정.
-      슬라이딩 윈도우 후 중단(0) 작업이 완료(1)보다 많아지는 경향이 있으므로
-      pos_weight = n_neg / n_pos 로 설정하면 균형이 맞춰짐.
-      기본값 2.0은 중단:완료 ≈ 2:1 비율을 가정.
+    pos_weight: 클래스 불균형 보정 (n_neg/n_pos, 기본 2.0).
     """
     def __init__(self, lambda_cls: float = 1.0, pos_weight: float = 2.0) -> None:
         super().__init__()
@@ -72,10 +68,16 @@ class MultiTaskLoss(nn.Module):
         )
 
     def forward(
-        self, pred: torch.Tensor, target: torch.Tensor
+        self,
+        pred_mem:  torch.Tensor,   # (B, T, 1) or (B, T) — memory ch0
+        cls_logit: torch.Tensor,   # (B,)       — from ClassificationHead
+        target:    torch.Tensor,   # (B, T, 2)
     ) -> tuple[torch.Tensor, dict]:
-        mse = nn.functional.mse_loss(pred[:, :, 0], target[:, :, 0])
-        bce = self.bce(pred[:, :, 1], target[:, :, 1])
+        # memory: squeeze to (B, T) if needed
+        p_mem = pred_mem[:, :, 0] if pred_mem.dim() == 3 else pred_mem
+        mse   = nn.functional.mse_loss(p_mem, target[:, :, 0])
+        # classification: last time-step label
+        bce   = self.bce(cls_logit, target[:, -1, 1])
         total = mse + self.lambda_cls * bce
         return total, {
             "loss": total.detach(),
@@ -101,18 +103,20 @@ def evaluate(
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        pred = model.predict(x)
+        pred = model.predict(x)                          # (B, T, C) memory
 
         mse = nn.functional.mse_loss(pred[:, :, 0], y[:, :, 0]).item()
         mae = nn.functional.l1_loss(pred[:, :, 0],  y[:, :, 0]).item()
-        bce = criterion.bce(pred[:, :, 1], y[:, :, 1]).item()
         mse_sum += mse * x.size(0)
         mae_sum += mae * x.size(0)
+
+        # 분류: cls_head 사용
+        cls_logit = model.predict_cls(x)                 # (B,)
+        bce = criterion.bce(cls_logit, y[:, -1, 1]).item()
         bce_sum += bce * x.size(0)
         n       += x.size(0)
 
-        # 분류 정확도: 마지막 time step 기준
-        prob  = torch.sigmoid(pred[:, -1, 1])
+        prob  = torch.sigmoid(cls_logit)
         label = y[:, -1, 1].long()
         pred_cls = (prob >= 0.5).long()
         tp += ((pred_cls == 1) & (label == 1)).sum().item()
@@ -163,7 +167,7 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
     cfg = TLLMConfig(
         context_length    = args.context_length,
         prediction_length = args.pred_length,
-        channels          = 2,          # ch0=memory, ch1=label
+        channels          = 2,          # ch0=memory, ch1=label (label은 cls_head가 처리)
         d_model           = 768,
         n_heads           = 4,
         dropout           = 0.1,
@@ -175,6 +179,7 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         lora_alpha        = 16.0,
         lora_dropout      = 0.05,
         dictionary_size   = 1024,
+        use_cls_head      = True,       # 전용 분류 head 활성화
     )
     model     = TLLM(cfg).to(device)
     criterion = MultiTaskLoss(lambda_cls=args.lambda_cls,
@@ -196,6 +201,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
     trainable = [p for p in
                  list(model.parameters()) + list(distill.parameters())
                  if p.requires_grad]
+    print(f"  cls_head params: "
+          f"{sum(p.numel() for p in model.cls_head.parameters()):,}"
+          if model.cls_head else "  cls_head: off")
     optimizer = torch.optim.Adam(trainable, lr=args.lr)
 
     total_p     = sum(p.numel() for p in model.parameters())
@@ -237,8 +245,8 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             }
             dist_loss, _ = distill(outputs_mem, y[:, :, 0:1])
 
-            # Multi-task loss: MSE(ch0) + BCE(ch1)
-            mt_loss, _ = criterion(outputs["student_pred"], y)
+            # Multi-task loss: MSE(ch0 memory) + BCE(cls_head logit)
+            mt_loss, _ = criterion(outputs["student_pred"], outputs["cls_logit"], y)
 
             loss = dist_loss + mt_loss
             loss.backward()

@@ -30,6 +30,9 @@ class TLLMConfig:
     # Input block
     dictionary_size: int = 1024
 
+    # Classification head (multi-task 용도, 기본 off)
+    use_cls_head: bool = False
+
     @property
     def spectral_bins(self) -> int:
         target = min(
