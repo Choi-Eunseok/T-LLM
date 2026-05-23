@@ -198,15 +198,13 @@ class TLLM(nn.Module):
 
     def _cls_logit(self, s_feat: dict, B: int) -> torch.Tensor:
         """
-        student last hidden state (B*C, seq_len, d_model)
-        → mean pool over seq_len → (B*C, d_model)
-        → reshape (B, C, d_model) → mean over C → (B, d_model)
-        → cls_head → (B,)
+        InputBlock은 채널을 시퀀스 차원에 포함시키므로
+        last_hidden_state shape = (B, seq_len, d_model).
+        → mean pool over seq_len → (B, d_model) → cls_head → (B,)
         """
-        late = s_feat["late"]                                    # (B*C, seq_len, d_model)
-        pooled = late.mean(dim=1)                                # (B*C, d_model)
-        pooled = pooled.view(B, self.cfg.channels, self.cfg.d_model).mean(dim=1)  # (B, d_model)
-        return self.cls_head(pooled)                             # (B,)
+        late   = s_feat["late"]       # (B, seq_len, d_model)
+        pooled = late.mean(dim=1)     # (B, d_model)
+        return self.cls_head(pooled)  # (B,)
 
     def forward(self, x: torch.Tensor, teacher: bool = True) -> dict[str, object]:
         B = x.size(0)
