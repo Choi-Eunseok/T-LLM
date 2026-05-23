@@ -238,7 +238,7 @@ def main() -> None:
         device = torch.device(args.device)
 
     # 체크포인트 로드
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     cfg: TLLMConfig = ckpt["cfg"]
     model = TLLM(cfg).to(device)
     model.load_state_dict(ckpt["model"])
