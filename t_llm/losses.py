@@ -43,11 +43,13 @@ class DistillationLoss(nn.Module):
         lambda_imit: float  = 1.0,
         lambda_guide: float = 0.01,
         lambda_stud: float  = 1.0,
+        noise_std: float    = 0.0,   # > 0 이면 teacher feature에 Gaussian noise 추가
     ) -> None:
         super().__init__()
         self.lambda_imit  = lambda_imit
         self.lambda_guide = lambda_guide
         self.lambda_stud  = lambda_stud
+        self.noise_std    = noise_std
         self.student_proj = GuidanceProjection(d_model)
         self.teacher_proj = GuidanceProjection(d_model)
 
@@ -65,13 +67,21 @@ class DistillationLoss(nn.Module):
         l_stud  = F.l1_loss(s_pred, target)
         l_imit  = F.l1_loss(s_pred, t_pred.detach())
 
+        # teacher feature noise (학습 중에만 적용)
+        if self.noise_std > 0 and self.training:
+            t_early = t_feat["early"] + torch.randn_like(t_feat["early"]) * self.noise_std
+            t_late  = t_feat["late"]  + torch.randn_like(t_feat["late"])  * self.noise_std
+        else:
+            t_early = t_feat["early"]
+            t_late  = t_feat["late"]
+
         # guidance at early and late layers (Eq. 24, K = {early, late})
         l_guide = 0.5 * F.mse_loss(
             self.student_proj(s_feat["early"]),
-            self.teacher_proj(t_feat["early"]).detach(),
+            self.teacher_proj(t_early).detach(),
         ) + 0.5 * F.mse_loss(
             self.student_proj(s_feat["late"]),
-            self.teacher_proj(t_feat["late"]).detach(),
+            self.teacher_proj(t_late).detach(),
         )
 
         total = (

@@ -94,7 +94,7 @@ class TraceDataset(Dataset):
 
 def load_trace(
     csv_path: str | Path,
-    context_length: int = 96,
+    context_length: int = 24,
     prediction_length: int = 12,
     train_ratio: float = 0.8,
     val_ratio:   float = 0.1,

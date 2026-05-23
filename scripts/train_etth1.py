@@ -143,6 +143,7 @@ def train_horizon(
         lambda_imit  = 1.0,
         lambda_guide = 0.01,
         lambda_stud  = 1.0,
+        noise_std    = args.noise_std,
     ).to(device)
 
     trainable = [p for p in list(model.parameters()) + list(criterion.parameters())
@@ -254,6 +255,8 @@ def parse_args() -> argparse.Namespace:
                    help="Directory to save per-horizon checkpoints. Set empty string to skip.")
     p.add_argument("--out",            type=Path,   default=Path("results/etth1.json"),
                    help="Path to write JSON results.")
+    p.add_argument("--noise-std",      type=float,  default=0.0,
+                   help="Gaussian noise σ added to teacher features during distillation. 0 = off.")
     return p.parse_args()
 
 

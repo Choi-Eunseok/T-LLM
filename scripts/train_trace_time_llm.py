@@ -1,5 +1,5 @@
 """
-T-LLM Multi-task 학습 스크립트 — Google Cluster Trace.
+Time-LLM Multi-task 학습 스크립트 — Google Cluster Trace.
 
 Task:
   - ch 0: memory 사용량 예측 (regression, MSE loss)
@@ -7,11 +7,9 @@ Task:
 
 Loss = MSE(ch0) + λ * BCE(ch1)
 
-ETTh1 비교용 체크포인트는 기존 train_etth1.py로 별도 생성.
-
 사용법:
-    python scripts/train_trace.py
-    python scripts/train_trace.py --csv data/google-cluster/cluster_trace.csv --device cuda
+    python scripts/train_trace_time_llm.py
+    python scripts/train_trace_time_llm.py --csv data/google-cluster/cluster_trace.csv --device cuda
 """
 
 import argparse
@@ -24,7 +22,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from t_llm import TLLM, TLLMConfig
+from time_llm.model import TimeLLM, TimeLLMConfig
 from t_llm.data_trace import load_trace
 
 
@@ -42,8 +40,10 @@ def seed_everything(seed: int) -> None:
 
 def get_device(choice: str) -> torch.device:
     if choice == "auto":
-        if torch.cuda.is_available():   return torch.device("cuda")
-        if torch.backends.mps.is_available(): return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
         return torch.device("cpu")
     return torch.device(choice)
 
@@ -82,7 +82,7 @@ class MultiTaskLoss(nn.Module):
 
 @torch.no_grad()
 def evaluate(
-    model: TLLM,
+    model: TimeLLM,
     loader: DataLoader,
     criterion: MultiTaskLoss,
     device: torch.device,
@@ -93,7 +93,7 @@ def evaluate(
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        pred = model.predict(x)
+        pred = model(x)                         # (B, T, 2)
 
         mse = nn.functional.mse_loss(pred[:, :, 0], y[:, :, 0]).item()
         bce = criterion.bce(pred[:, :, 1], y[:, :, 1]).item()
@@ -102,8 +102,8 @@ def evaluate(
         n       += x.size(0)
 
         # 분류 정확도: 마지막 time step 기준
-        prob  = torch.sigmoid(pred[:, -1, 1])
-        label = y[:, -1, 1].long()
+        prob     = torch.sigmoid(pred[:, -1, 1])
+        label    = y[:, -1, 1].long()
         pred_cls = (prob >= 0.5).long()
         tp += ((pred_cls == 1) & (label == 1)).sum().item()
         fp += ((pred_cls == 1) & (label == 0)).sum().item()
@@ -140,52 +140,47 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         split_file        = args.split_file,
     )
     loader_kw = dict(
-        num_workers       = args.num_workers,
-        pin_memory        = (device.type == "cuda"),
-        persistent_workers= (args.num_workers > 0),
+        num_workers        = args.num_workers,
+        pin_memory         = (device.type == "cuda"),
+        persistent_workers = (args.num_workers > 0),
     )
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,  **loader_kw)
     val_loader   = DataLoader(val_set,   batch_size=args.batch_size, **loader_kw)
     test_loader  = DataLoader(test_set,  batch_size=args.batch_size, **loader_kw)
 
     # ---- model ----
-    cfg = TLLMConfig(
+    cfg = TimeLLMConfig(
         context_length    = args.context_length,
         prediction_length = args.pred_length,
-        channels          = 2,          # ch0=memory, ch1=label
-        d_model           = 768,
-        n_heads           = 4,
+        channels          = 2,              # ch0=memory, ch1=label
+        patch_len         = 16,
+        stride            = 8,
+        d_model           = 32,
+        d_llm             = 768,
+        n_heads           = 8,
         dropout           = 0.1,
-        teacher_layers    = 2,
-        moving_average_kernel = 25,
+        n_text_prototypes = 1000,
+        prompt_token_len  = 32,
         gpt2_model_name   = "gpt2",
-        student_layers    = 6,
-        lora_rank         = 8,
-        lora_alpha        = 16.0,
-        lora_dropout      = 0.05,
-        dictionary_size   = 1024,
+        dataset_desc      = (
+            "Google Cluster Trace 2019: instance-level CPU/memory usage "
+            "from Google data centers sampled every 5 minutes. "
+            "Each job is either completed or evicted/killed."
+        ),
     )
-    model     = TLLM(cfg).to(device)
+    model     = TimeLLM(cfg).to(device)
     criterion = MultiTaskLoss(lambda_cls=args.lambda_cls)
 
-    # distillation loss (teacher branch)
-    from t_llm import DistillationLoss
-    distill = DistillationLoss(
-        d_model      = cfg.d_model,
-        lambda_imit  = 1.0,
-        lambda_guide = 0.01,
-        lambda_stud  = 1.0,
-        noise_std    = args.noise_std,
-    ).to(device)
-
-    trainable = [p for p in
-                 list(model.parameters()) + list(distill.parameters())
-                 if p.requires_grad]
+    trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable, lr=args.lr)
 
     total_p     = sum(p.numel() for p in model.parameters())
     trainable_p = sum(p.numel() for p in trainable)
     print(f"params: total={total_p/1e6:.1f}M  trainable={trainable_p/1e6:.1f}M")
+
+    # AMP scaler (CUDA only)
+    use_amp = (device.type == "cuda") and args.amp
+    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     # ---- training loop ----
     best_val_f1  = -1.0
@@ -202,17 +197,15 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad(set_to_none=True)
 
-            # T-LLM distillation forward
-            outputs = model(x, teacher=True)
-            dist_loss, _ = distill(outputs, y)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                pred = model(x)                         # (B, T, 2)
+                loss, _ = criterion(pred, y)
 
-            # multi-task loss on student output
-            mt_loss, _ = criterion(outputs["student_pred"], y)
-
-            loss = dist_loss + mt_loss
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item() * x.size(0)
             train_n    += x.size(0)
@@ -259,7 +252,7 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
     if args.ckpt_dir:
         ckpt_dir = Path(args.ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_path = ckpt_dir / "trace.pt"
+        ckpt_path = ckpt_dir / "trace_time_llm.pt"
         torch.save({"model": best_state, "cfg": cfg}, ckpt_path)
         print(f"  Checkpoint: {ckpt_path}")
 
@@ -276,13 +269,13 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="T-LLM on Google Cluster Trace.")
+    p = argparse.ArgumentParser(description="Time-LLM on Google Cluster Trace.")
     p.add_argument("--csv",            type=Path,  default=Path("data/google-cluster/cluster_trace.csv"))
     p.add_argument("--context-length", type=int,   default=24)
     p.add_argument("--pred-length",    type=int,   default=12)
     p.add_argument("--epochs",         type=int,   default=50)
     p.add_argument("--batch-size",     type=int,   default=64)
-    p.add_argument("--lr",             type=float, default=5e-4)
+    p.add_argument("--lr",             type=float, default=1e-4)
     p.add_argument("--lambda-cls",     type=float, default=1.0,
                    help="BCE loss 가중치.")
     p.add_argument("--min-epochs",     type=int,   default=3)
@@ -290,12 +283,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--device",         choices=["auto","cpu","cuda","mps"], default="auto")
     p.add_argument("--num-workers",    type=int,   default=2)
+    p.add_argument("--amp",            action="store_true",
+                   help="Enable AMP (mixed precision, CUDA only).")
     p.add_argument("--split-file",     type=Path,  default=Path("data/google-cluster/split.json"),
                    help="Instance split 재현용 JSON.")
     p.add_argument("--ckpt-dir",       type=str,   default="checkpoints")
-    p.add_argument("--out",            type=Path,  default=Path("results/trace.json"))
-    p.add_argument("--noise-std",      type=float, default=0.0,
-                   help="Gaussian noise σ added to teacher features during distillation. 0 = off.")
+    p.add_argument("--out",            type=Path,  default=Path("results/trace_time_llm.json"))
     return p.parse_args()
 
 

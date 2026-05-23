@@ -224,7 +224,7 @@ def main() -> None:
     p.add_argument("--csv",        type=Path, default=Path("data/google-cluster/cluster_trace.csv"))
     p.add_argument("--ckpt",       type=Path, default=Path("checkpoints/trace.pt"))
     p.add_argument("--split-file", type=Path, default=Path("data/google-cluster/split.json"))
-    p.add_argument("--context",    type=int,  default=96)
+    p.add_argument("--context",    type=int,  default=24)
     p.add_argument("--pred-len",   type=int,  default=12)
     p.add_argument("--batch-size", type=int,  default=64)
     p.add_argument("--device",     default="auto")
