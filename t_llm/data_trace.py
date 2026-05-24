@@ -52,7 +52,8 @@ class TraceDataset(Dataset):
         self.scaler            = scaler
 
         # instance별로 시계열 슬라이딩 윈도우 생성
-        self.samples: list[tuple[np.ndarray, np.ndarray]] = []
+        self.samples:  list[tuple[np.ndarray, np.ndarray]] = []
+        self.job_ids:  list[tuple] = []   # 각 샘플의 (collection_id, instance_index)
         all_memory = []
 
         for cid, iidx in instance_ids:
@@ -75,6 +76,7 @@ class TraceDataset(Dataset):
                 x = ts[start                  : start + context_length]
                 y = ts[start + context_length : start + total]
                 self.samples.append((x, y))
+                self.job_ids.append((cid, iidx))
 
         if fit_scaler and all_memory:
             flat = np.concatenate(all_memory).reshape(-1, 1)
@@ -109,9 +111,15 @@ def load_trace(
     late_ratio: float = 0.5,
 ) -> tuple[TraceDataset, TraceDataset, TraceDataset]:
     """
-    CSV를 읽어 instance-level split 후 (train, val, test) 반환.
+    CSV를 읽어 stratified instance-level split 후 (train, val, test) 반환.
 
     split_file: 지정하면 split 결과를 JSON으로 저장/재현.
+
+    Stratified split 이유:
+      무작위 split 시 val/test의 class 비율이 크게 달라질 수 있다.
+      (예: val=55% completed, test=40% completed)
+      → val 기준으로 학습한 모델이 test에서 역방향으로 틀림.
+      완료(label=1) / 중단(label=0)을 각각 분리해 동일 비율로 분배한다.
     """
     df = pd.read_csv(csv_path)
 
@@ -143,25 +151,55 @@ def load_trace(
         test_ids  = [tuple(x) for x in splits["test"]]
         print(f"  split 재사용: {split_file}")
     else:
+        # ── Stratified split: completed / evicted 비율을 각 split에서 동일하게 유지 ──
+        # job당 label은 모든 row에서 동일 (상수값). 첫 row에서 가져옴.
+        job_label_map = (
+            df.groupby(["collection_id", "instance_index"])["label"]
+            .first()
+            .to_dict()
+        )
+        pos_ids = [id for id in instance_ids if job_label_map.get(id, 0) == 1]
+        neg_ids = [id for id in instance_ids if job_label_map.get(id, 0) == 0]
+
         rng = random.Random(seed)
-        shuffled = instance_ids[:]
-        rng.shuffle(shuffled)
-        n = len(shuffled)
-        n_train = int(n * train_ratio)
-        n_val   = int(n * val_ratio)
-        train_ids = shuffled[:n_train]
-        val_ids   = shuffled[n_train : n_train + n_val]
-        test_ids  = shuffled[n_train + n_val:]
+        rng.shuffle(pos_ids)
+        rng.shuffle(neg_ids)
+
+        def strat_split(ids):
+            n       = len(ids)
+            n_train = int(n * train_ratio)
+            n_val   = int(n * val_ratio)
+            return ids[:n_train], ids[n_train:n_train + n_val], ids[n_train + n_val:]
+
+        pos_tr, pos_va, pos_te = strat_split(pos_ids)
+        neg_tr, neg_va, neg_te = strat_split(neg_ids)
+
+        train_ids = pos_tr + neg_tr
+        val_ids   = pos_va + neg_va
+        test_ids  = pos_te + neg_te
+
+        # 클래스 분포 출력 (검증용)
+        n_pos_val  = len(pos_va);  n_pos_te = len(pos_te)
+        n_neg_val  = len(neg_va);  n_neg_te = len(neg_te)
+        print(f"  클래스 비율 — "
+              f"completed(1): {len(pos_ids)}/{len(instance_ids)} "
+              f"({100*len(pos_ids)/len(instance_ids):.1f}%)  "
+              f"evicted(0): {len(neg_ids)}/{len(instance_ids)} "
+              f"({100*len(neg_ids)/len(instance_ids):.1f}%)")
+        print(f"  val  — completed={n_pos_val}, evicted={n_neg_val} "
+              f"(pos_ratio={100*n_pos_val/max(n_pos_val+n_neg_val,1):.1f}%)")
+        print(f"  test — completed={n_pos_te}, evicted={n_neg_te} "
+              f"(pos_ratio={100*n_pos_te/max(n_pos_te+n_neg_te,1):.1f}%)")
+
         if split_file:
             Path(split_file).parent.mkdir(parents=True, exist_ok=True)
-            # numpy.int64 → Python int 변환 후 직렬화
             def to_py(ids):
                 return [[int(c), int(i)] for c, i in ids]
             with open(split_file, "w") as f:
                 json.dump({"train": to_py(train_ids),
                            "val":   to_py(val_ids),
                            "test":  to_py(test_ids)}, f)
-            print(f"  split 저장: {split_file}")
+            print(f"  split 저장 (stratified): {split_file}")
 
     print(f"  train={len(train_ids)}  val={len(val_ids)}  test={len(test_ids)}")
 

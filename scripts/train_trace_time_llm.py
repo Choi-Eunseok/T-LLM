@@ -336,8 +336,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers",    type=int,   default=2)
     p.add_argument("--amp",            action="store_true",
                    help="Enable AMP (mixed precision, CUDA only).")
-    p.add_argument("--split-file",     type=Path,  default=Path("data/google-cluster/split.json"),
-                   help="Instance split 재현용 JSON.")
+    p.add_argument("--split-file",     type=Path,  default=Path("data/google-cluster/split_stratified.json"),
+                   help="Stratified instance split 재현용 JSON.")
     p.add_argument("--ckpt-dir",       type=str,   default="checkpoints")
     p.add_argument("--out",            type=Path,  default=Path("results/trace_time_llm.json"))
     return p.parse_args()

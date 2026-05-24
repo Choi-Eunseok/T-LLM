@@ -376,8 +376,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",           type=int,   default=42)
     p.add_argument("--device",         choices=["auto","cpu","cuda","mps"], default="auto")
     p.add_argument("--num-workers",    type=int,   default=2)
-    p.add_argument("--split-file",     type=Path,  default=Path("data/google-cluster/split.json"),
-                   help="Instance split 재현용 JSON.")
+    p.add_argument("--split-file",     type=Path,  default=Path("data/google-cluster/split_stratified.json"),
+                   help="Stratified instance split 재현용 JSON. 기존 split.json 있으면 삭제 후 재생성.")
     p.add_argument("--ckpt-dir",       type=str,   default="checkpoints")
     p.add_argument("--out",            type=Path,  default=Path("results/trace.json"))
     p.add_argument("--noise-std",      type=float, default=0.0,
