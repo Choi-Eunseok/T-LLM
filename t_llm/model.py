@@ -161,10 +161,15 @@ class ClassificationHead(nn.Module):
 
     # x_norm (RevIN 후): 패턴 피처 (trend, 후반 slope 등)
     # x_raw  (RevIN 전): 절대 수준 피처 (mean, max 등) — RevIN이 제거한 정보 복원
+    #
+    # LLM pooled 피처를 의도적으로 제거한 이유:
+    #   LoRA 가중치가 regression loss로 계속 업데이트되면 pooled 값이 매 step 변하고,
+    #   cls_head는 moving target을 쫓아 진동한다. CNN(x_raw) + stats만 쓰면
+    #   cls_head가 LoRA 학습과 완전히 독립되어 안정적으로 수렴한다.
     N_STATS: int = 8   # (norm: 2) + (raw: 6) — 아래 compute_stats 참고
     CNN_DIM: int = 128  # 16 필터 × AdaptiveAvgPool(8) = 128
 
-    def __init__(self, d_model: int, dropout: float = 0.1) -> None:
+    def __init__(self, dropout: float = 0.1) -> None:
         super().__init__()
         # 1-D CNN: x_raw(RevIN 이전) 메모리에서 패턴+수준 함께 학습
         self.mem_encoder = nn.Sequential(
@@ -174,24 +179,23 @@ class ClassificationHead(nn.Module):
             nn.GELU(),
             nn.AdaptiveAvgPool1d(8),   # 입력 길이에 무관하게 8-step 압축
         )
-        in_dim = d_model + self.N_STATS + self.CNN_DIM
+        in_dim = self.N_STATS + self.CNN_DIM  # LLM pooled 제외 — 안정성을 위해
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, in_dim // 4),
+            nn.Linear(in_dim, max(in_dim // 2, 64)),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(in_dim // 4, 1),
+            nn.Linear(max(in_dim // 2, 64), 1),
         )
 
     def forward(
         self,
-        pooled:  torch.Tensor,   # (B, d_model)  — detached LLM pool
         stats:   torch.Tensor,   # (B, N_STATS)
-        mem_raw: torch.Tensor,   # (B, L)         — x_raw의 memory 채널 (RevIN 이전)
+        mem_raw: torch.Tensor,   # (B, L)  — x_raw의 memory 채널 (RevIN 이전)
     ) -> torch.Tensor:
         cnn_feat = self.mem_encoder(mem_raw.unsqueeze(1))   # (B, 16, 8)
         cnn_feat = cnn_feat.view(mem_raw.size(0), -1)       # (B, 128)
-        x = torch.cat([pooled, stats, cnn_feat], dim=1)     # (B, d_model+N_STATS+CNN_DIM)
+        x = torch.cat([stats, cnn_feat], dim=1)             # (B, N_STATS+CNN_DIM)
         return self.net(x).squeeze(-1)                       # (B,)
 
     @staticmethod
@@ -263,27 +267,24 @@ class TLLM(nn.Module):
         self.teacher = TemporalTeacher(cfg)
 
         # 분류 head (use_cls_head=True 일 때만 생성)
-        self.cls_head = ClassificationHead(cfg.d_model, cfg.dropout) if cfg.use_cls_head else None
+        self.cls_head = ClassificationHead(cfg.dropout) if cfg.use_cls_head else None
 
     def _cls_logit(
         self,
-        s_feat: dict,
         x_norm: torch.Tensor,   # RevIN 정규화 후 — 패턴 피처용
         x_raw:  torch.Tensor,   # RevIN 정규화 전 — 절대 수준 피처 + CNN 입력
     ) -> torch.Tensor:
         """
-        GPT-2 hidden state (detached) + stats(raw+norm) + 1D-CNN(raw) → logit.
+        CNN(x_raw) + stats(x_norm, x_raw) → logit.
 
-        - x_norm: RevIN 후 값 → 상대 패턴 (trend 등)
-        - x_raw : RevIN 전 값 → 절대 메모리 수준 (mean, max 등)
-          ※ RevIN이 mean/std를 제거하므로 x_norm만 쓰면 level 정보 손실
-        - .detach(): BCE gradient가 LoRA regression 학습을 방해하지 않도록 격리
+        LLM pooled 피처를 사용하지 않는다:
+          LoRA가 regression으로 계속 학습되면 pooled 값이 매 step 변해
+          cls_head가 moving target을 쫓아 진동한다.
+          CNN + raw stats만 쓰면 LoRA와 완전히 독립적으로 안정 수렴.
         """
-        late   = s_feat["late"].detach()                                    # no grad to LLM
-        pooled = late.mean(dim=1)                                           # (B, d_model)
-        stats  = ClassificationHead.compute_stats(x_norm, x_raw)           # (B, 8)
-        mem_raw = x_raw[:, :, 0]                                            # (B, L) RevIN 이전 memory
-        return self.cls_head(pooled, stats, mem_raw)                        # (B,)
+        stats   = ClassificationHead.compute_stats(x_norm, x_raw)  # (B, 8)
+        mem_raw = x_raw[:, :, 0]                                    # (B, L) RevIN 이전 memory
+        return self.cls_head(stats, mem_raw)                        # (B,)
 
     def forward(self, x: torch.Tensor, teacher: bool = True) -> dict[str, object]:
         B = x.size(0)
@@ -294,7 +295,7 @@ class TLLM(nn.Module):
         result: dict[str, object] = {"student_pred": s_pred, "student_features": s_feat}
 
         if self.cls_head is not None:
-            result["cls_logit"] = self._cls_logit(s_feat, x_norm, x)  # (B,)  x=RevIN 이전
+            result["cls_logit"] = self._cls_logit(x_norm, x)  # (B,)  x=RevIN 이전
 
         if teacher:
             t_pred_norm, t_feat = self.teacher(teacher_tokens)
@@ -318,9 +319,7 @@ class TLLM(nn.Module):
         assert self.cls_head is not None, "use_cls_head=False 로 생성된 모델"
         self.eval()
         x_norm, _, _ = self.revin.normalize(x)
-        _, student_tokens = self.input(x_norm)
-        _, s_feat = self.student(student_tokens)
-        return self._cls_logit(s_feat, x_norm, x)  # x=RevIN 이전 절대 수준 필요
+        return self._cls_logit(x_norm, x)  # LLM forward 불필요 — CNN+stats만 사용
 
     @torch.no_grad()
     def predict_teacher(self, x: torch.Tensor) -> torch.Tensor:
