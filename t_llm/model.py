@@ -159,18 +159,20 @@ class ClassificationHead(nn.Module):
     Output: (B,) — raw logit (BCEWithLogitsLoss 사용)
     """
 
-    N_STATS: int = 6
-    CNN_DIM: int = 128   # 16 필터 × AdaptiveAvgPool(8) = 128
+    # x_norm (RevIN 후): 패턴 피처 (trend, 후반 slope 등)
+    # x_raw  (RevIN 전): 절대 수준 피처 (mean, max 등) — RevIN이 제거한 정보 복원
+    N_STATS: int = 8   # (norm: 2) + (raw: 6) — 아래 compute_stats 참고
+    CNN_DIM: int = 128  # 16 필터 × AdaptiveAvgPool(8) = 128
 
     def __init__(self, d_model: int, dropout: float = 0.1) -> None:
         super().__init__()
-        # 1-D CNN: 메모리 시퀀스에서 패턴 추출
+        # 1-D CNN: x_raw(RevIN 이전) 메모리에서 패턴+수준 함께 학습
         self.mem_encoder = nn.Sequential(
             nn.Conv1d(1, 16, kernel_size=5, padding=2),
             nn.GELU(),
             nn.Conv1d(16, 16, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.AdaptiveAvgPool1d(8),          # 입력 길이에 무관하게 8-step 압축
+            nn.AdaptiveAvgPool1d(8),   # 입력 길이에 무관하게 8-step 압축
         )
         in_dim = d_model + self.N_STATS + self.CNN_DIM
         self.net = nn.Sequential(
@@ -183,38 +185,53 @@ class ClassificationHead(nn.Module):
 
     def forward(
         self,
-        pooled:  torch.Tensor,   # (B, d_model)
+        pooled:  torch.Tensor,   # (B, d_model)  — detached LLM pool
         stats:   torch.Tensor,   # (B, N_STATS)
-        mem_seq: torch.Tensor,   # (B, L)
+        mem_raw: torch.Tensor,   # (B, L)         — x_raw의 memory 채널 (RevIN 이전)
     ) -> torch.Tensor:
-        cnn_feat = self.mem_encoder(mem_seq.unsqueeze(1))   # (B, 16, 8)
-        cnn_feat = cnn_feat.view(mem_seq.size(0), -1)       # (B, 128)
+        cnn_feat = self.mem_encoder(mem_raw.unsqueeze(1))   # (B, 16, 8)
+        cnn_feat = cnn_feat.view(mem_raw.size(0), -1)       # (B, 128)
         x = torch.cat([pooled, stats, cnn_feat], dim=1)     # (B, d_model+N_STATS+CNN_DIM)
         return self.net(x).squeeze(-1)                       # (B,)
 
     @staticmethod
-    def compute_stats(x_norm: torch.Tensor) -> torch.Tensor:
+    def compute_stats(
+        x_norm: torch.Tensor,   # (B, L, C) — RevIN 정규화 후 (패턴)
+        x_raw:  torch.Tensor,   # (B, L, C) — RevIN 정규화 전 (절대 수준)
+    ) -> torch.Tensor:
         """
-        정규화된 입력에서 메모리 통계량 추출.
+        returns: (B, 8)
+          ── x_norm 기반 (RevIN 후: 상대 패턴) ──
+          [0] trend       — 정규화 시퀀스의 전체 추세 (last - first)
+          [1] late_trend  — 정규화 시퀀스의 후반 추세 (last - mid)
+          ── x_raw  기반 (RevIN 전: 절대 수준) ──
+          [2] raw_mean    — 절대 평균 메모리 수준  ← RevIN이 제거한 핵심 피처
+          [3] raw_std     — 절대 변동성
+          [4] raw_max     — 절대 최대 메모리 (자원 압박)
+          [5] raw_last    — 마지막 관측 메모리 (종료 직전 수준)
+          [6] raw_range   — 절대 변동 폭
+          [7] raw_late_tr — 절대값 기준 후반 추세 (last - mid)
+        """
+        mem_n = x_norm[:, :, 0]   # (B, L) — RevIN 후 패턴
+        mem_r = x_raw[:,  :, 0]   # (B, L) — RevIN 전 절대 수준
+        half = mem_n.shape[1] // 2
 
-        x_norm : (B, L, C)  — RevIN 정규화된 입력
-        returns: (B, 6)
-          [0] mean      — 평균 메모리 수준
-          [1] std       — 변동성 (높으면 불안정)
-          [2] trend     — 전체 추세 (last - first)
-          [3] late_trend— 후반 추세 (last - mid)  ← eviction 직전 패턴
-          [4] max       — 최대 메모리 (자원 압박 지표)
-          [5] range     — max - min  (변동 폭)
-        """
-        mem  = x_norm[:, :, 0]              # (B, L) memory channel
-        half = mem.shape[1] // 2
-        mean_v      = mem.mean(dim=1)
-        std_v       = mem.std(dim=1).clamp(min=1e-6)
-        trend       = mem[:, -1] - mem[:, 0]
-        late_trend  = mem[:, -1] - mem[:, half]
-        max_v       = mem.max(dim=1).values
-        range_v     = max_v - mem.min(dim=1).values
-        return torch.stack([mean_v, std_v, trend, late_trend, max_v, range_v], dim=1)
+        # 패턴 피처 (RevIN 정규화 후 — 상대 기울기)
+        trend      = mem_n[:, -1] - mem_n[:, 0]
+        late_trend = mem_n[:, -1] - mem_n[:, half]
+
+        # 절대 수준 피처 (RevIN 정규화 전 — 중요한 discriminative 신호)
+        raw_mean    = mem_r.mean(dim=1)
+        raw_std     = mem_r.std(dim=1).clamp(min=1e-6)
+        raw_max     = mem_r.max(dim=1).values
+        raw_last    = mem_r[:, -1]
+        raw_range   = raw_max - mem_r.min(dim=1).values
+        raw_late_tr = mem_r[:, -1] - mem_r[:, half]
+
+        return torch.stack(
+            [trend, late_trend, raw_mean, raw_std, raw_max, raw_last, raw_range, raw_late_tr],
+            dim=1,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -248,18 +265,25 @@ class TLLM(nn.Module):
         # 분류 head (use_cls_head=True 일 때만 생성)
         self.cls_head = ClassificationHead(cfg.d_model, cfg.dropout) if cfg.use_cls_head else None
 
-    def _cls_logit(self, s_feat: dict, x_norm: torch.Tensor) -> torch.Tensor:
+    def _cls_logit(
+        self,
+        s_feat: dict,
+        x_norm: torch.Tensor,   # RevIN 정규화 후 — 패턴 피처용
+        x_raw:  torch.Tensor,   # RevIN 정규화 전 — 절대 수준 피처 + CNN 입력
+    ) -> torch.Tensor:
         """
-        GPT-2 hidden state (detached) + memory stats + raw memory CNN → logit.
+        GPT-2 hidden state (detached) + stats(raw+norm) + 1D-CNN(raw) → logit.
 
-        .detach()로 gradient를 격리해 regression 학습을 방해하지 않음.
-        Classification은 CNN path가 주로 담당.
+        - x_norm: RevIN 후 값 → 상대 패턴 (trend 등)
+        - x_raw : RevIN 전 값 → 절대 메모리 수준 (mean, max 등)
+          ※ RevIN이 mean/std를 제거하므로 x_norm만 쓰면 level 정보 손실
+        - .detach(): BCE gradient가 LoRA regression 학습을 방해하지 않도록 격리
         """
-        late   = s_feat["late"].detach()                           # (B, seq_len, d_model), no grad to LLM
-        pooled = late.mean(dim=1)                                  # (B, d_model)
-        stats  = ClassificationHead.compute_stats(x_norm)          # (B, 6)
-        mem_seq = x_norm[:, :, 0]                                  # (B, L) memory channel only
-        return self.cls_head(pooled, stats, mem_seq)               # (B,)
+        late   = s_feat["late"].detach()                                    # no grad to LLM
+        pooled = late.mean(dim=1)                                           # (B, d_model)
+        stats  = ClassificationHead.compute_stats(x_norm, x_raw)           # (B, 8)
+        mem_raw = x_raw[:, :, 0]                                            # (B, L) RevIN 이전 memory
+        return self.cls_head(pooled, stats, mem_raw)                        # (B,)
 
     def forward(self, x: torch.Tensor, teacher: bool = True) -> dict[str, object]:
         B = x.size(0)
@@ -270,7 +294,7 @@ class TLLM(nn.Module):
         result: dict[str, object] = {"student_pred": s_pred, "student_features": s_feat}
 
         if self.cls_head is not None:
-            result["cls_logit"] = self._cls_logit(s_feat, x_norm)  # (B,)
+            result["cls_logit"] = self._cls_logit(s_feat, x_norm, x)  # (B,)  x=RevIN 이전
 
         if teacher:
             t_pred_norm, t_feat = self.teacher(teacher_tokens)
@@ -296,7 +320,7 @@ class TLLM(nn.Module):
         x_norm, _, _ = self.revin.normalize(x)
         _, student_tokens = self.input(x_norm)
         _, s_feat = self.student(student_tokens)
-        return self._cls_logit(s_feat, x_norm)
+        return self._cls_logit(s_feat, x_norm, x)  # x=RevIN 이전 절대 수준 필요
 
     @torch.no_grad()
     def predict_teacher(self, x: torch.Tensor) -> torch.Tensor:
