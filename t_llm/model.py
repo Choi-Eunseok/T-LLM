@@ -143,23 +143,36 @@ class GPT2LoRAStudent(nn.Module):
 
 class ClassificationHead(nn.Module):
     """
-    LLM pooled hidden state + 메모리 통계량을 결합해 binary classification.
+    메모리 시계열에서 job completion / eviction 분류.
+
+    세 가지 정보를 결합:
+      1) CNN path   : 원시 메모리 시퀀스 (B, L) → 1-D CNN → (B, CNN_DIM)
+                      종료 직전 패턴(감소/급증 등)을 직접 학습
+      2) stats path : 수작업 통계량 6개 (B, N_STATS)
+      3) LLM path   : .detach()된 GPT-2 풀링 (B, d_model)
+                      regression gradient가 classification을 방해하지 않도록 격리
 
     Input:
-      pooled : (B, d_model)  — LLM last hidden state, mean-pooled over seq
-      stats  : (B, N_STATS)  — 메모리 직접 통계량 (아래 compute_stats 참고)
-    Output: (B,)             — raw logit (BCEWithLogitsLoss 사용)
-
-    통계량을 직접 제공하는 이유:
-      LLM hidden state는 메모리 예측에 최적화돼 completion 신호가 약함.
-      메모리 level·trend·variance는 eviction과 직접 상관관계가 있음.
+      pooled  : (B, d_model)  — GPT-2 last hidden state, mean-pooled, detached
+      stats   : (B, N_STATS)  — 수작업 메모리 통계량
+      mem_seq : (B, L)        — RevIN 정규화된 메모리 채널 원시 시퀀스
+    Output: (B,) — raw logit (BCEWithLogitsLoss 사용)
     """
 
-    N_STATS: int = 6   # compute_stats 반환 차원
+    N_STATS: int = 6
+    CNN_DIM: int = 128   # 16 필터 × AdaptiveAvgPool(8) = 128
 
     def __init__(self, d_model: int, dropout: float = 0.1) -> None:
         super().__init__()
-        in_dim = d_model + self.N_STATS
+        # 1-D CNN: 메모리 시퀀스에서 패턴 추출
+        self.mem_encoder = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=5, padding=2),
+            nn.GELU(),
+            nn.Conv1d(16, 16, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(8),          # 입력 길이에 무관하게 8-step 압축
+        )
+        in_dim = d_model + self.N_STATS + self.CNN_DIM
         self.net = nn.Sequential(
             nn.LayerNorm(in_dim),
             nn.Linear(in_dim, in_dim // 4),
@@ -168,9 +181,16 @@ class ClassificationHead(nn.Module):
             nn.Linear(in_dim // 4, 1),
         )
 
-    def forward(self, pooled: torch.Tensor, stats: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([pooled, stats], dim=1)   # (B, d_model + N_STATS)
-        return self.net(x).squeeze(-1)           # (B,)
+    def forward(
+        self,
+        pooled:  torch.Tensor,   # (B, d_model)
+        stats:   torch.Tensor,   # (B, N_STATS)
+        mem_seq: torch.Tensor,   # (B, L)
+    ) -> torch.Tensor:
+        cnn_feat = self.mem_encoder(mem_seq.unsqueeze(1))   # (B, 16, 8)
+        cnn_feat = cnn_feat.view(mem_seq.size(0), -1)       # (B, 128)
+        x = torch.cat([pooled, stats, cnn_feat], dim=1)     # (B, d_model+N_STATS+CNN_DIM)
+        return self.net(x).squeeze(-1)                       # (B,)
 
     @staticmethod
     def compute_stats(x_norm: torch.Tensor) -> torch.Tensor:
@@ -230,15 +250,16 @@ class TLLM(nn.Module):
 
     def _cls_logit(self, s_feat: dict, x_norm: torch.Tensor) -> torch.Tensor:
         """
-        InputBlock은 채널을 시퀀스 차원에 포함시키므로
-        last_hidden_state shape = (B, seq_len, d_model).
-        → mean pool over seq_len → (B, d_model)
-        + raw memory statistics → cls_head → (B,)
+        GPT-2 hidden state (detached) + memory stats + raw memory CNN → logit.
+
+        .detach()로 gradient를 격리해 regression 학습을 방해하지 않음.
+        Classification은 CNN path가 주로 담당.
         """
-        late   = s_feat["late"]                                    # (B, seq_len, d_model)
+        late   = s_feat["late"].detach()                           # (B, seq_len, d_model), no grad to LLM
         pooled = late.mean(dim=1)                                  # (B, d_model)
         stats  = ClassificationHead.compute_stats(x_norm)          # (B, 6)
-        return self.cls_head(pooled, stats)                        # (B,)
+        mem_seq = x_norm[:, :, 0]                                  # (B, L) memory channel only
+        return self.cls_head(pooled, stats, mem_seq)               # (B,)
 
     def forward(self, x: torch.Tensor, teacher: bool = True) -> dict[str, object]:
         B = x.size(0)
