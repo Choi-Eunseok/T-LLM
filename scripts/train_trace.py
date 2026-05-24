@@ -199,13 +199,26 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         noise_std    = args.noise_std,
     ).to(device)
 
-    trainable = [p for p in
-                 list(model.parameters()) + list(distill.parameters())
-                 if p.requires_grad]
+    # cls_head 파라미터 분리: 높은 lr + weight_decay로 빠른 수렴 + 과적합 방지
+    # (CNN 제거 후 소형 MLP이므로 lr=5e-3, wd=1e-2 적합)
+    cls_params   = set(model.cls_head.parameters()) if model.cls_head else set()
+    main_params  = [p for p in
+                    list(model.parameters()) + list(distill.parameters())
+                    if p.requires_grad and p not in cls_params]
+    trainable    = main_params + list(cls_params)
+
     print(f"  cls_head params: "
           f"{sum(p.numel() for p in model.cls_head.parameters()):,}"
           if model.cls_head else "  cls_head: off")
-    optimizer = torch.optim.Adam(trainable, lr=args.lr)
+
+    param_groups = [{"params": main_params, "lr": args.lr}]
+    if cls_params:
+        param_groups.append({
+            "params":       list(cls_params),
+            "lr":           args.lr_cls,
+            "weight_decay": args.wd_cls,
+        })
+    optimizer = torch.optim.Adam(param_groups)
 
     total_p     = sum(p.numel() for p in model.parameters())
     trainable_p = sum(p.numel() for p in trainable)
@@ -371,6 +384,10 @@ def parse_args() -> argparse.Namespace:
                    help="Gaussian noise σ added to teacher features during distillation. 0 = off.")
     p.add_argument("--late-ratio",     type=float, default=0.5,
                    help="job 후반 몇 %% 구간에서만 윈도우 생성 (0.0=전체, 0.5=후반50%%).")
+    p.add_argument("--lr-cls",         type=float, default=5e-3,
+                   help="cls_head 전용 learning rate (LoRA보다 10x 높게 설정).")
+    p.add_argument("--wd-cls",         type=float, default=1e-2,
+                   help="cls_head weight decay — overfitting 방지.")
     return p.parse_args()
 
 

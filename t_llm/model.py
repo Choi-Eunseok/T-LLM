@@ -162,41 +162,29 @@ class ClassificationHead(nn.Module):
     # x_norm (RevIN 후): 패턴 피처 (trend, 후반 slope 등)
     # x_raw  (RevIN 전): 절대 수준 피처 (mean, max 등) — RevIN이 제거한 정보 복원
     #
-    # LLM pooled 피처를 의도적으로 제거한 이유:
-    #   LoRA 가중치가 regression loss로 계속 업데이트되면 pooled 값이 매 step 변하고,
-    #   cls_head는 moving target을 쫓아 진동한다. CNN(x_raw) + stats만 쓰면
-    #   cls_head가 LoRA 학습과 완전히 독립되어 안정적으로 수렴한다.
+    # CNN 대신 stats-only 소형 MLP를 사용하는 이유:
+    #   instance-level split이므로 실제 독립 샘플은 job 수(~3K)에 불과하다.
+    #   job당 ~70개의 겹치는 윈도우가 있어 CNN이 training job 패턴을 암기한다.
+    #   → val BCE가 epoch마다 증가하는 overfitting 발생.
+    #   stats 8개 + 소형 MLP + strong dropout으로 일반화 능력 확보.
     N_STATS: int = 8   # (norm: 2) + (raw: 6) — 아래 compute_stats 참고
-    CNN_DIM: int = 128  # 16 필터 × AdaptiveAvgPool(8) = 128
 
-    def __init__(self, dropout: float = 0.1) -> None:
+    def __init__(self, dropout: float = 0.5) -> None:
         super().__init__()
-        # 1-D CNN: x_raw(RevIN 이전) 메모리에서 패턴+수준 함께 학습
-        self.mem_encoder = nn.Sequential(
-            nn.Conv1d(1, 16, kernel_size=5, padding=2),
-            nn.GELU(),
-            nn.Conv1d(16, 16, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool1d(8),   # 입력 길이에 무관하게 8-step 압축
-        )
-        in_dim = self.N_STATS + self.CNN_DIM  # LLM pooled 제외 — 안정성을 위해
         self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, max(in_dim // 2, 64)),
+            nn.BatchNorm1d(self.N_STATS),   # batch 통계로 안정화 (LayerNorm 대비 일반화↑)
+            nn.Linear(self.N_STATS, 32),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(max(in_dim // 2, 64), 1),
+            nn.Linear(32, 1),
         )
 
     def forward(
         self,
         stats:   torch.Tensor,   # (B, N_STATS)
-        mem_raw: torch.Tensor,   # (B, L)  — x_raw의 memory 채널 (RevIN 이전)
+        mem_raw: torch.Tensor | None = None,  # 사용 안 함 (API 호환성 유지)
     ) -> torch.Tensor:
-        cnn_feat = self.mem_encoder(mem_raw.unsqueeze(1))   # (B, 16, 8)
-        cnn_feat = cnn_feat.view(mem_raw.size(0), -1)       # (B, 128)
-        x = torch.cat([stats, cnn_feat], dim=1)             # (B, N_STATS+CNN_DIM)
-        return self.net(x).squeeze(-1)                       # (B,)
+        return self.net(stats).squeeze(-1)   # (B,)
 
     @staticmethod
     def compute_stats(
