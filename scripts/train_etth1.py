@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import json
+import math
 import random
 import shutil
 import time
@@ -138,13 +139,25 @@ def train_horizon(
         lora_dropout      = 0.05,
         dictionary_size   = 1024,
     )
-    model     = TLLM(cfg).to(device)
+    model = TLLM(cfg).to(device)
+
+    # horizon-adaptive noise: 긴 horizon일수록 noise를 줄여 long-range signal 보존
+    effective_noise_std = (
+        args.noise_std * math.sqrt(96 / horizon)
+        if args.noise_adaptive and args.noise_std > 0
+        else args.noise_std
+    )
+    if args.noise_std > 0 and args.noise_adaptive:
+        print(f"  [h={horizon}] horizon-adaptive noise: {args.noise_std:.3f} → {effective_noise_std:.4f}",
+              flush=True)
+
     criterion = DistillationLoss(
-        d_model      = cfg.d_model,
-        lambda_imit  = 1.0,
-        lambda_guide = 0.01,
-        lambda_stud  = 1.0,
-        noise_std    = args.noise_std,
+        d_model          = cfg.d_model,
+        lambda_imit      = 1.0,
+        lambda_guide     = 0.01,
+        lambda_stud      = 1.0,
+        noise_std        = effective_noise_std,
+        noise_early_only = args.noise_early_only,
     ).to(device)
 
     trainable = [p for p in list(model.parameters()) + list(criterion.parameters())
@@ -163,6 +176,10 @@ def train_horizon(
         torch.cuda.reset_peak_memory_stats(device)
 
     for epoch in range(1, args.epochs + 1):
+        # noise annealing: epoch마다 noise_std를 decay (학습 안정화)
+        if args.noise_decay != 1.0 and effective_noise_std > 0:
+            criterion.noise_std = effective_noise_std * (args.noise_decay ** (epoch - 1))
+
         epoch_start = time.perf_counter()
         model.train()
         train_loss = train_n = 0
@@ -262,6 +279,10 @@ def train_horizon(
         "test_mae":              test_mae,
         "paper_mse":             paper.get("mse"),
         "paper_mae":             paper.get("mae"),
+        "noise_std_init":        effective_noise_std,
+        "noise_decay":           args.noise_decay,
+        "noise_early_only":      args.noise_early_only,
+        "noise_adaptive":        args.noise_adaptive,
         "train_total_sec":       round(total_train_sec, 2),
         "avg_epoch_sec":         round(avg_epoch_sec, 2),
         "infer_ms_per_sample":   round(infer_ms_per_sample, 4),
@@ -295,8 +316,17 @@ def parse_args() -> argparse.Namespace:
                    help="Directory to save per-horizon checkpoints. Set empty string to skip.")
     p.add_argument("--out",            type=Path,   default=Path("results/etth1.json"),
                    help="Path to write JSON results.")
-    p.add_argument("--noise-std",      type=float,  default=0.0,
+    p.add_argument("--noise-std",        type=float,  default=0.0,
                    help="Gaussian noise σ added to teacher features during distillation. 0 = off.")
+    p.add_argument("--noise-decay",      type=float,  default=1.0,
+                   help="Multiplicative decay applied to noise_std each epoch. "
+                        "1.0=constant, 0.95=annealing. Noise -> 0 as training progresses.")
+    p.add_argument("--noise-adaptive",   action="store_true",
+                   help="Scale noise inversely with horizon: σ_eff = σ * sqrt(96/horizon). "
+                        "Reduces noise for long horizons (h=336/720) automatically.")
+    p.add_argument("--noise-early-only", action="store_true",
+                   help="Apply noise only to early teacher features, keep late features clean. "
+                        "Preserves long-range signal while still regularizing shallow features.")
     return p.parse_args()
 
 

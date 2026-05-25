@@ -44,12 +44,14 @@ class DistillationLoss(nn.Module):
         lambda_guide: float = 0.01,
         lambda_stud: float  = 1.0,
         noise_std: float    = 0.0,   # > 0 이면 teacher feature에 Gaussian noise 추가
+        noise_early_only: bool = False,  # True이면 early feature에만 noise (late는 클린 유지)
     ) -> None:
         super().__init__()
-        self.lambda_imit  = lambda_imit
-        self.lambda_guide = lambda_guide
-        self.lambda_stud  = lambda_stud
-        self.noise_std    = noise_std
+        self.lambda_imit      = lambda_imit
+        self.lambda_guide     = lambda_guide
+        self.lambda_stud      = lambda_stud
+        self.noise_std        = noise_std
+        self.noise_early_only = noise_early_only
         self.student_proj = GuidanceProjection(d_model)
         self.teacher_proj = GuidanceProjection(d_model)
 
@@ -68,9 +70,12 @@ class DistillationLoss(nn.Module):
         l_imit  = F.l1_loss(s_pred, t_pred.detach())
 
         # teacher feature noise (학습 중에만 적용)
+        # noise_early_only=True: early feature에만 noise → late는 장기 의존성 보존
         if self.noise_std > 0 and self.training:
             t_early = t_feat["early"] + torch.randn_like(t_feat["early"]) * self.noise_std
-            t_late  = t_feat["late"]  + torch.randn_like(t_feat["late"])  * self.noise_std
+            t_late  = (t_feat["late"]
+                       if self.noise_early_only
+                       else t_feat["late"] + torch.randn_like(t_feat["late"]) * self.noise_std)
         else:
             t_early = t_feat["early"]
             t_late  = t_feat["late"]
