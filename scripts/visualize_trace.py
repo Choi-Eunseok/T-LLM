@@ -25,10 +25,70 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from t_llm import TLLM, TLLMConfig
 from t_llm.data_trace import load_trace
+
+try:
+    from time_llm.model import TimeLLM, TimeLLMConfig
+    _HAS_TIME_LLM = True
+except ImportError:
+    _HAS_TIME_LLM = False
+
+
+# ---------------------------------------------------------------------------
+# 모델 타입 공통 인터페이스 래퍼
+# ---------------------------------------------------------------------------
+
+class _TimeLLMWrapper:
+    """
+    TimeLLM을 TLLM과 동일한 인터페이스(predict / predict_cls)로 감싸는 래퍼.
+    TimeLLM.forward(x) → (B, T, 2): ch0=memory, ch1=completion logit(time-series)
+    """
+    def __init__(self, model: "TimeLLM") -> None:
+        self._m = model
+
+    def eval(self):
+        self._m.eval()
+        return self
+
+    @torch.no_grad()
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """메모리 예측 — (B, T, 2) 반환 (ch0=memory)."""
+        self._m.eval()
+        return self._m(x)                   # (B, T, 2)
+
+    @torch.no_grad()
+    def predict_cls(self, x: torch.Tensor) -> torch.Tensor:
+        """완료 로짓 — 마지막 타임스텝 ch1 (B,)."""
+        self._m.eval()
+        out = self._m(x)                    # (B, T, 2)
+        return out[:, -1, 1]               # (B,) raw logit
+
+
+def _load_model(ckpt_path: Path, device: torch.device):
+    """체크포인트에서 cfg 타입을 자동 감지하여 올바른 모델 로드."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    cfg  = ckpt["cfg"]
+
+    if isinstance(cfg, TLLMConfig):
+        model = TLLM(cfg)
+        model_label = "T-LLM"
+    elif _HAS_TIME_LLM and isinstance(cfg, TimeLLMConfig):
+        model = _TimeLLMWrapper(TimeLLM(cfg))
+        model_label = "Time-LLM"
+    else:
+        raise ValueError(f"알 수 없는 config 타입: {type(cfg)}")
+
+    # state_dict 로드 (래퍼인 경우 내부 모델에 적용)
+    target = model._m if isinstance(model, _TimeLLMWrapper) else model
+    target.load_state_dict(ckpt["model"])
+    target.to(device)
+    target.eval()
+
+    print(f"모델 로드 [{model_label}]: {ckpt_path}")
+    return model, cfg, model_label
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +97,7 @@ from t_llm.data_trace import load_trace
 
 @torch.no_grad()
 def collect_predictions(
-    model: TLLM,
+    model,          # TLLM 또는 _TimeLLMWrapper
     loader: DataLoader,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -68,7 +128,7 @@ def collect_predictions(
 
 def pick_samples_by_job(
     test_set,
-    model: TLLM,
+    model,          # TLLM 또는 _TimeLLMWrapper
     device: torch.device,
     n_completed: int = 4,
     n_evicted:   int = 4,
@@ -141,10 +201,11 @@ def pick_samples_by_job(
 # ---------------------------------------------------------------------------
 
 def plot_forecasts(
-    samples:  list[dict],
+    samples:     list[dict],
     scaler,
-    out_path: Path,
-    n_cols: int = 4,
+    out_path:    Path,
+    n_cols:      int = 4,
+    model_label: str = "T-LLM",
 ) -> None:
     """
     각 sample subplot:
@@ -160,7 +221,7 @@ def plot_forecasts(
 
     fig = plt.figure(figsize=(n_cols * 5, n_rows * 5.5))
     fig.suptitle(
-        "T-LLM — Google Cluster Trace  (one window per job instance)",
+        f"{model_label} — Google Cluster Trace  (one window per job instance)",
         fontsize=13, y=1.002,
     )
     gs = gridspec.GridSpec(
@@ -251,7 +312,7 @@ def plot_forecasts(
         ax_gauge.tick_params(labelsize=6)
 
         # 실제 label 범례 레이블
-        actual_bg = "✅ Completed" if s["label"] == 1 else "❌ Evicted"
+        actual_bg = "[O] Completed" if s["label"] == 1 else "[X] Evicted"
         ax_gauge.set_title(f"actual outcome: {actual_bg}", fontsize=6.5,
                            color="darkgreen" if s["label"] == 1 else "crimson")
 
@@ -339,12 +400,8 @@ def main() -> None:
     else:
         device = torch.device(args.device)
 
-    # 체크포인트 로드
-    ckpt  = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    cfg: TLLMConfig = ckpt["cfg"]
-    model = TLLM(cfg).to(device)
-    model.load_state_dict(ckpt["model"])
-    print(f"모델 로드: {args.ckpt}")
+    # 체크포인트 로드 (T-LLM / Time-LLM 자동 감지)
+    model, cfg, model_label = _load_model(args.ckpt, device)
 
     # 데이터 로드 (stratified split 재현)
     _, _, test_set = load_trace(
@@ -385,12 +442,13 @@ def main() -> None:
     # ── 그래프 생성 ─────────────────────────────────────────
     plot_forecasts(
         samples, scaler,
-        out_path = args.out_dir / "trace_forecast.png",
-        n_cols   = 4,
+        out_path    = args.out_dir / f"trace_forecast_{model_label.lower().replace('-','')}.png",
+        n_cols      = 4,
+        model_label = model_label,
     )
     plot_cls_result(
         cls_true, cls_prob,
-        out_path = args.out_dir / "trace_cls_result.png",
+        out_path = args.out_dir / f"trace_cls_result_{model_label.lower().replace('-','')}.png",
     )
 
 
