@@ -240,9 +240,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             flush=True,
         )
 
-        # checkpoint: F1 기준
+        # checkpoint: MSE 기준 (Time-LLM은 전용 분류 head가 없으므로 regression 성능 기준)
         improved = (epoch >= args.min_epochs and
-                    val_metrics["f1"] > best_val_f1)
+                    val_metrics["mse"] < best_val_mse)
         if improved:
             best_val_f1  = val_metrics["f1"]
             best_val_mse = val_metrics["mse"]
