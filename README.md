@@ -1,15 +1,44 @@
-# T-LLM vs Time-LLM — ETTh1 Benchmark
+# T-LLM vs Time-LLM — Forecasting & Job Completion Prediction
 
-PyTorch reimplementation of two LLM-based time series forecasting methods, evaluated on ETTh1 long-term forecasting.
+PyTorch reimplementation of two LLM-based time series forecasting methods, evaluated on:
+- **ETTh1** long-term forecasting (4 horizons)
+- **Google Cluster Trace 2019** memory forecasting + job completion classification (multi-task)
 
-| Model | Backbone | h=96 | h=192 | h=336 | h=720 | Avg MSE |
-|-------|----------|------|-------|-------|-------|---------|
-| **T-LLM** (ours) | GPT-2 + LoRA | 0.3916 | 0.4496 | 0.4862 | 0.5148 | **0.4605** |
-| **Time-LLM** (ours) | GPT-2 frozen | 0.4060 | 0.4599 | 0.4895 | 0.5156 | 0.4678 |
+---
+
+## Results
+
+### ETTh1 Long-term Forecasting (MSE ↓, MAE ↓)
+
+| Model | Backbone | h=96 | h=192 | h=336 | h=720 | **Avg MSE** |
+|-------|----------|------|-------|-------|-------|-------------|
+| **T-LLM** (ours) | GPT-2 + LoRA | 0.3937 | **0.4440** | **0.4908** | 0.5308 | 0.4648 |
+| **T-LLM + Noisy** (ours) | GPT-2 + LoRA | **0.3875** | 0.4711 | 0.5024 | 0.5171 | 0.4695 |
+| **Time-LLM** (ours) | GPT-2 frozen | 0.3908 | 0.4461 | 0.4992 | **0.5018** | **0.4595** |
 | T-LLM (paper) | GPT-2 + LoRA | 0.417 | 0.439 | 0.458 | 0.449 | 0.441 |
 | Time-LLM (paper) | LLaMA-7B | 0.404 | 0.448 | 0.481 | 0.461 | 0.449 |
 
-> Paper results for Time-LLM use LLaMA-7B. Both our runs use GPT-2 for a fair backbone-controlled comparison.
+> Paper results for Time-LLM use LLaMA-7B. Our Time-LLM run uses GPT-2 for a fair backbone-controlled comparison.
+
+### Google Cluster Trace — Memory Forecasting + Job Completion (Multi-task)
+
+| Model | Memory MSE ↓ | Completion ACC ↑ | Completion F1 ↑ | AUC ↑ |
+|-------|-------------|-----------------|----------------|-------|
+| **T-LLM** (ours) | **0.1713** | **0.712** | **0.752** | **0.797** |
+| **T-LLM + Noisy** (ours) | 0.1718 | 0.710 | 0.751 | 0.798 |
+| Time-LLM (ours) | 0.1733 | N/A¹ | N/A¹ | N/A¹ |
+
+> ¹ Time-LLM has no dedicated classification head. RevIN normalizes the constant label channel (0/1) to all-zeros, making the two classes indistinguishable at the input level.
+
+### Training Efficiency (ETTh1, all 4 horizons combined)
+
+| Model | Total Train Time | Per-epoch | Inference | GPU (train) | GPU (infer) |
+|-------|-----------------|-----------|-----------|-------------|-------------|
+| **T-LLM** | **~44 min** | **6–7 s** | **0.23 ms/sample** | **2.5 GB** | **1.3 GB** |
+| **T-LLM + Noisy** | ~44 min | 6–7 s | 0.22 ms/sample | 2.5 GB | 1.3 GB |
+| Time-LLM | ~40.5 h | 950–1190 s | 17.9 ms/sample | 20.2 GB | 2.9 GB |
+
+T-LLM trains **55× faster** and runs inference **78× faster** than Time-LLM, using **8× less GPU memory**.
 
 ---
 
@@ -19,26 +48,61 @@ PyTorch reimplementation of two LLM-based time series forecasting methods, evalu
 **Paper**: [T-LLM: Teaching Large Language Models to Forecast Time Series via Temporal Distillation](https://arxiv.org/abs/2602.01937)
 
 Key components:
+- **RevIN**: per-sample instance normalization (mean/std stored for denormalization)
 - **Input Block**: channel embedding → channel self-attention (teacher tokens) → cross-attention with compact GPT-2 word dictionary (student tokens)
-- **Temporal Teacher**: 2-layer DLinear trend block + Adaptive Spectral Block + Trend-Periodic Fusion gate (training only)
-- **GPT-2 Student**: first 6 GPT-2 layers + LoRA (rank=8, alpha=16)
-- **Distillation Loss**: L = L_teach + 1.0·L_imit + 0.01·L_guide + 1.0·L_stud
-- **RevIN**: per-sample instance normalization
+- **Temporal Teacher**: 2-layer [DLinear trend + Adaptive Spectral Block + Trend-Periodic Fusion] (training only)
+- **GPT-2 Student**: first 6 GPT-2 layers + LoRA (rank=8, alpha=16); backbone frozen
+- **Distillation Loss**: `L = L_teach + 1.0·L_imit + 0.01·L_guide + 1.0·L_stud`
+- **ClassificationHead** (Trace only): 8 hand-crafted memory statistics (trend, raw_mean, raw_std, raw_max, …) → 337-param MLP; uses `x_raw` (pre-RevIN) to preserve absolute level signal
 
-Trainable params: ~10.4M (LoRA adapters + teacher + input block)
+Trainable params: ~12.5M (LoRA + teacher + input block + cls_head)
+
+#### T-LLM + Noisy Teacher
+Adds Gaussian noise to teacher intermediate features during distillation guidance (`--noise-std`).
+Three adaptive strategies implemented:
+- `--noise-decay`: multiplicative annealing per epoch (e.g. 0.95)
+- `--noise-adaptive`: scales σ inversely with horizon — `σ_eff = σ × √(96/h)`
+- `--noise-early-only`: noise on early features only; late features kept clean for long-range signal
 
 ### Time-LLM
 **Paper**: [Time-LLM: Time Series Forecasting by Reprogramming Large Language Models](https://arxiv.org/abs/2310.01728)
 
 Key components:
 - **Patch Embedding**: sliding window patches (patch_len=16, stride=8) → d_model=32
-- **Mapping Layer**: learnable projection over GPT-2 vocabulary → source embeddings (K/V)
-- **Reprogramming Layer**: multi-head cross-attention (Q=patches, K/V=source embeddings)
-- **Prompt-as-Prefix**: per-sample statistics (min/max/median/trend/top-5 lags) + dataset/task description prepended to LLM input
+- **Reprogramming Layer**: cross-attention (Q=patches, K/V=learnable source embeddings mapped from GPT-2 vocabulary)
+- **Prompt-as-Prefix**: per-sample statistics (min/max/median/trend/top-5 lags) + dataset description
 - **Frozen GPT-2**: full 12-layer backbone, no gradient
 - **RevIN**: per-sample instance normalization
 
-Trainable params: ~56.8M (mapping_layer dominates at ~50M)
+Trainable params: ~52–58M (mapping layer ~50M dominates)
+
+---
+
+## Datasets
+
+### ETTh1
+Electricity Transformer Temperature dataset (hourly), 7 channels.
+Auto-downloaded on first run if `--csv` is not found.
+
+### Google Cluster Trace 2019
+BigQuery extract of Google datacenter workloads. Each row is a 5-minute measurement.
+
+| Column | Description |
+|--------|-------------|
+| `collection_id` | Job identifier |
+| `instance_index` | Task within job |
+| `date` | Timestamp |
+| `memory` | Normalized memory usage (regression target, ch0) |
+| `label` | 1 = completed, 0 = evicted/killed (classification target, ch1) |
+
+**Split**: stratified instance-level (80/10/10 train/val/test by job ID, class ratio preserved).
+Reproducible via `data/google-cluster/split_stratified.json`.
+
+```
+Instances: 3,779  (completed 50.6% / evicted 49.4%)
+Train windows: 240,532  |  Val: 24,308  |  Test: 19,119
+(late_ratio=0.5: windows sampled from final 50% of each job's timeline)
+```
 
 ---
 
@@ -46,7 +110,7 @@ Trainable params: ~56.8M (mapping_layer dominates at ~50M)
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
@@ -57,70 +121,127 @@ pip install -e ".[dev]"
 ### T-LLM on ETTh1
 
 ```bash
-python scripts/train_etth1.py --device cuda --csv data/ETT-small/ETTh1.csv
+python scripts/train_etth1.py --device cuda
 ```
 
-Key arguments:
-```
---horizon       96 192 336 720   (default: all four)
---context-length 96              (paper default)
---epochs        50
---batch-size    64
---lr            5e-4
---min-epochs    3
---patience      10
---ckpt-dir      checkpoints
---out           results/etth1.json
-```
-
-### Time-LLM on ETTh1
-
+With Noisy Teacher:
 ```bash
-python scripts/train_etth1_time_llm.py --device cuda --csv data/ETT-small/ETTh1.csv
+python scripts/train_etth1.py --device cuda \
+    --noise-std 0.1 --noise-decay 0.95 --noise-adaptive --noise-early-only \
+    --out results/etth1_noisy.json --ckpt-dir checkpoints/noisy
 ```
 
 Key arguments:
 ```
 --horizon         96 192 336 720   (default: all four)
---context-length  512              (paper default)
---epochs          100
---batch-size      24
---lr              0.01
---patience        20
+--context-length  96
+--epochs          50
+--lr              5e-4
+--patience        10
+--noise-std       0.0              (>0 enables Noisy Teacher)
+--noise-decay     1.0              (multiplicative decay per epoch)
+--noise-adaptive                   (scale noise by sqrt(96/h))
+--noise-early-only                 (noise on early features only)
 --ckpt-dir        checkpoints
---out             results/etth1_time_llm.json
+--out             results/etth1.json
 ```
 
-ETTh1 data is downloaded automatically on first run of `train_etth1.py` if not found at `--csv`.
+### Time-LLM on ETTh1
+
+```bash
+python scripts/train_etth1_time_llm.py --device cuda --context-length 96
+```
+
+### T-LLM on Google Cluster Trace (multi-task)
+
+```bash
+python scripts/train_trace.py --device cuda \
+    --csv data/google-cluster/cluster_trace.csv \
+    --ckpt-dir checkpoints/tllm_trace
+```
+
+With Noisy Teacher:
+```bash
+python scripts/train_trace.py --device cuda --noise-std 0.1 \
+    --ckpt-dir checkpoints/tllm_noisy_trace --out results/trace_noisy.json
+```
+
+### Time-LLM on Google Cluster Trace
+
+```bash
+python scripts/train_trace_time_llm.py --device cuda \
+    --ckpt-dir checkpoints/timellm_trace
+```
 
 ---
 
-## Results
+## Visualization
 
-Results are saved as JSON to `results/`:
-- `results/etth1.json` — T-LLM per-horizon results
-- `results/etth1_time_llm.json` — Time-LLM per-horizon results
+```bash
+# T-LLM (basic)
+python scripts/visualize_trace.py --device cuda \
+    --ckpt checkpoints/tllm_trace/trace.pt
 
----
+# T-LLM + Noisy
+python scripts/visualize_trace.py --device cuda \
+    --ckpt checkpoints/tllm_noisy_trace/trace.pt
 
-## Input / Output Format
-
+# Time-LLM
+python scripts/visualize_trace.py --device cuda \
+    --ckpt checkpoints/timellm_trace/trace_time_llm.pt
 ```
-Input:  [batch, context_length, channels]
-Output: [batch, prediction_length, channels]
-```
+
+Generates two plots per model in `results/plots/`:
+- `trace_forecast_{model}.png` — memory prediction curves for 8 diverse jobs (4 completed / 4 evicted), with completion probability gauge
+- `trace_cls_result_{model}.png` — ROC curve + confusion matrix over the full test set
 
 ---
 
 ## Project Structure
 
 ```
-t_llm/          T-LLM package (config, data, layers, model, losses)
-time_llm/       Time-LLM package (config + model)
+t_llm/
+  config.py           TLLMConfig dataclass
+  data.py             ETTh1 dataset / loader
+  data_trace.py       Google Cluster Trace dataset (stratified split)
+  layers.py           RevIN, DLinear, SpectralBlock, ForecastHead, …
+  losses.py           DistillationLoss (+ Noisy Teacher noise injection)
+  model.py            TLLM, TemporalTeacher, GPT2LoRAStudent, ClassificationHead
+
+time_llm/
+  config.py           TimeLLMConfig dataclass
+  model.py            TimeLLM (reprogramming + frozen GPT-2)
+
 scripts/
-  train_etth1.py            T-LLM training
-  train_etth1_time_llm.py   Time-LLM training
-data/ETT-small/ETTh1.csv    auto-downloaded
-results/                    JSON result files
-checkpoints/                saved model weights
+  train_etth1.py              T-LLM training on ETTh1
+  train_etth1_time_llm.py     Time-LLM training on ETTh1
+  train_trace.py              T-LLM multi-task training on Trace
+  train_trace_time_llm.py     Time-LLM training on Trace
+  visualize_trace.py          Trace prediction + classification visualization
+
+data/
+  ETT-small/ETTh1.csv                   auto-downloaded
+  google-cluster/cluster_trace.csv      BigQuery export
+  google-cluster/split_stratified.json  reproducible train/val/test split
+
+results/
+  etth1.json              T-LLM ETTh1 results
+  etth1_noisy_v2.json     T-LLM + Noisy ETTh1 results
+  etth1_time_llm.json     Time-LLM ETTh1 results
+  trace_tllm.json         T-LLM Trace results
+  trace_noisy.json        T-LLM + Noisy Trace results
+  trace_time_llm.json     Time-LLM Trace results
+  plots/                  visualization outputs
+
+checkpoints/              saved model weights (.pt)
+seraph/                   SLURM job scripts for cluster execution
 ```
+
+---
+
+## Notes
+
+- **Noisy Teacher does not significantly improve T-LLM on Trace**: The classification head uses only `x_raw` statistics (pre-RevIN), which is completely decoupled from the teacher distillation path. Noise affects only the guidance loss (`L_guide`, λ=0.01), which contributes minimally to the total loss dominated by BCE (λ=5).
+- **Time-LLM cannot classify on Trace**: The label channel is constant (all 0s or all 1s per job). RevIN normalizes this to all-zeros regardless of the true label, so the model receives identical input for both classes.
+- **ETTh1 teacher overfitting**: Teacher val MSE consistently degrades after epoch 2–3 across all horizons. The student checkpoint is selected at this early point, limiting the benefit of longer training or noise strategies.
+- **val_mse vs test_mse gap on Trace** (0.022 vs 0.17): val jobs have narrower memory ranges; test metrics are the ground truth for paper reporting.
