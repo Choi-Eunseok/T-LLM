@@ -34,11 +34,11 @@ PyTorch reimplementation of two LLM-based time series forecasting methods, evalu
 
 | Model | Total Train Time | Per-epoch | Inference | GPU (train) | GPU (infer) |
 |-------|-----------------|-----------|-----------|-------------|-------------|
-| **T-LLM** | **~44 min** | **6–7 s** | **0.23 ms/sample** | **2.5 GB** | **1.3 GB** |
-| **T-LLM + Noisy** | ~44 min | 6–7 s | 0.22 ms/sample | 2.5 GB | 1.3 GB |
+| **T-LLM** | **~10.5 min** | **6–7 s** | **0.23 ms/sample** | **2.5 GB** | **1.3 GB** |
+| **T-LLM + Noisy** | ~10.8 min | 6–7 s | 0.22 ms/sample | 2.5 GB | 1.3 GB |
 | Time-LLM | ~40.5 h | 950–1190 s | 17.9 ms/sample | 20.2 GB | 2.9 GB |
 
-T-LLM trains **55× faster** and runs inference **78× faster** than Time-LLM, using **8× less GPU memory**.
+T-LLM trains **231× faster** and runs inference **78× faster** than Time-LLM, using **8× less GPU memory**.
 
 ### Training Efficiency (Google Cluster Trace, single run)
 
