@@ -44,7 +44,8 @@ except ImportError:
 class _TimeLLMWrapper:
     """
     TimeLLM을 TLLM과 동일한 인터페이스(predict / predict_cls)로 감싸는 래퍼.
-    TimeLLM.forward(x) → (B, T, 2): ch0=memory, ch1=completion logit(time-series)
+    TimeLLM.forward(x) → (B, T, C): ch0=memory.
+    분류는 T-LLM과 동일한 stats 기반 cls_head(predict_cls) 사용.
     """
     def __init__(self, model: "TimeLLM") -> None:
         self._m = model
@@ -55,16 +56,15 @@ class _TimeLLMWrapper:
 
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """메모리 예측 — (B, T, 2) 반환 (ch0=memory)."""
+        """메모리 예측 — (B, T, C) 반환 (ch0=memory)."""
         self._m.eval()
-        return self._m(x)                   # (B, T, 2)
+        return self._m(x)                   # (B, T, C)
 
     @torch.no_grad()
     def predict_cls(self, x: torch.Tensor) -> torch.Tensor:
-        """완료 로짓 — 마지막 타임스텝 ch1 (B,)."""
+        """완료 로짓 — stats 기반 cls_head (B,)."""
         self._m.eval()
-        out = self._m(x)                    # (B, T, 2)
-        return out[:, -1, 1]               # (B,) raw logit
+        return self._m.predict_cls(x)       # (B,) raw logit
 
 
 def _load_model(ckpt_path: Path, device: torch.device):

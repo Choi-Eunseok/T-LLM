@@ -55,9 +55,11 @@ def get_device(choice: str) -> torch.device:
 
 class MultiTaskLoss(nn.Module):
     """
-    ch 0 → MSE  (memory regression)
-    ch 1 → BCE  (completion classification)
-    total = mse + lambda_cls * bce
+    memory (ch0) → MSE
+    completion   → BCE  (cls_head logit 사용, ch1 시계열 출력 대신)
+
+    T-LLM과 동일한 stats-only ClassificationHead를 사용하므로 BCE는
+    cls_logit으로 계산한다 (RevIN이 파괴하는 label 채널 회귀를 쓰지 않음).
     """
     def __init__(self, lambda_cls: float = 1.0, pos_weight: float = 2.0) -> None:
         super().__init__()
@@ -67,10 +69,13 @@ class MultiTaskLoss(nn.Module):
         )
 
     def forward(
-        self, pred: torch.Tensor, target: torch.Tensor
+        self,
+        pred_mem:  torch.Tensor,   # (B, T, C) — memory ch0
+        cls_logit: torch.Tensor,   # (B,)       — from ClassificationHead
+        target:    torch.Tensor,   # (B, T, 2)
     ) -> tuple[torch.Tensor, dict]:
-        mse = nn.functional.mse_loss(pred[:, :, 0], target[:, :, 0])
-        bce = self.bce(pred[:, :, 1], target[:, :, 1])
+        mse   = nn.functional.mse_loss(pred_mem[:, :, 0], target[:, :, 0])
+        bce   = self.bce(cls_logit, target[:, -1, 1])
         total = mse + self.lambda_cls * bce
         return total, {
             "loss": total.detach(),
@@ -96,18 +101,21 @@ def evaluate(
 
     for x, y in loader:
         x, y = x.to(device), y.to(device)
-        pred = model(x)                         # (B, T, 2)
+        pred = model.predict(x)                 # (B, T, C) memory
 
         mse = nn.functional.mse_loss(pred[:, :, 0], y[:, :, 0]).item()
         mae = nn.functional.l1_loss(pred[:, :, 0],  y[:, :, 0]).item()
-        bce = criterion.bce(pred[:, :, 1], y[:, :, 1]).item()
         mse_sum += mse * x.size(0)
         mae_sum += mae * x.size(0)
+
+        # 분류: cls_head 사용
+        cls_logit = model.predict_cls(x)        # (B,)
+        bce = criterion.bce(cls_logit, y[:, -1, 1]).item()
         bce_sum += bce * x.size(0)
         n       += x.size(0)
 
         # 분류 정확도: 마지막 time step 기준
-        prob     = torch.sigmoid(pred[:, -1, 1])
+        prob     = torch.sigmoid(cls_logit)
         label    = y[:, -1, 1].long()
         pred_cls = (prob >= 0.5).long()
         tp += ((pred_cls == 1) & (label == 1)).sum().item()
@@ -169,6 +177,7 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         n_text_prototypes = 1000,
         prompt_token_len  = 32,
         gpt2_model_name   = "gpt2",
+        use_cls_head      = True,           # T-LLM과 동일한 stats 분류 head
         dataset_desc      = (
             "Google Cluster Trace 2019: instance-level CPU/memory usage "
             "from Google data centers sampled every 5 minutes. "
@@ -182,8 +191,24 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
         pos_weight=torch.tensor([args.pos_weight], device=device)
     )
 
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable, lr=args.lr)
+    # cls_head 파라미터 분리: 높은 lr + weight_decay (T-LLM과 동일 설정)
+    cls_params  = set(model.cls_head.parameters()) if model.cls_head else set()
+    main_params = [p for p in model.parameters()
+                   if p.requires_grad and p not in cls_params]
+    trainable   = main_params + list(cls_params)
+
+    print(f"  cls_head params: "
+          f"{sum(p.numel() for p in model.cls_head.parameters()):,}"
+          if model.cls_head else "  cls_head: off")
+
+    param_groups = [{"params": main_params, "lr": args.lr}]
+    if cls_params:
+        param_groups.append({
+            "params":       list(cls_params),
+            "lr":           args.lr_cls,
+            "weight_decay": args.wd_cls,
+        })
+    optimizer = torch.optim.Adam(param_groups)
 
     total_p     = sum(p.numel() for p in model.parameters())
     trainable_p = sum(p.numel() for p in trainable)
@@ -214,8 +239,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
-                pred = model(x)                         # (B, T, 2)
-                loss, _ = criterion(pred, y)
+                pred      = model(x)                     # (B, T, C) memory
+                cls_logit = model._cls_logit(x)          # (B,) — cls_head
+                loss, _   = criterion(pred, cls_logit, y)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -240,9 +266,9 @@ def train(args: argparse.Namespace, device: torch.device) -> dict:
             flush=True,
         )
 
-        # checkpoint: MSE 기준 (Time-LLM은 전용 분류 head가 없으므로 regression 성능 기준)
+        # checkpoint: F1 기준 (T-LLM과 동일 — stats 분류 head 사용)
         improved = (epoch >= args.min_epochs and
-                    val_metrics["mse"] < best_val_mse)
+                    val_metrics["f1"] > best_val_f1)
         if improved:
             best_val_f1  = val_metrics["f1"]
             best_val_mse = val_metrics["mse"]
@@ -323,6 +349,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs",         type=int,   default=50)
     p.add_argument("--batch-size",     type=int,   default=64)
     p.add_argument("--lr",             type=float, default=1e-4)
+    p.add_argument("--lr-cls",         type=float, default=5e-3,
+                   help="cls_head 전용 학습률 (소형 stats MLP, 빠른 수렴).")
+    p.add_argument("--wd-cls",         type=float, default=1e-2,
+                   help="cls_head 전용 weight decay (과적합 방지).")
     p.add_argument("--lambda-cls",     type=float, default=5.0,
                    help="BCE loss 가중치. MSE(~0.02) 대비 BCE(~0.5) 균형을 위해 기본값 5.0.")
     p.add_argument("--pos-weight",     type=float, default=2.0,

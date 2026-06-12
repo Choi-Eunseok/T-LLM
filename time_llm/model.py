@@ -16,6 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import GPT2Model, GPT2Tokenizer
 
+from t_llm.model import ClassificationHead
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -38,6 +40,8 @@ class TimeLLMConfig:
     n_text_prototypes: int   = 1000  # K in mapping_layer
     prompt_token_len:  int   = 32    # fixed max prompt length (left-padded)
     gpt2_model_name:   str   = "gpt2"
+
+    use_cls_head:      bool  = False # job completion 분류용 stats head (Trace 전용)
 
     dataset_desc: str = (
         "ETT (Electricity Transformer Temperature) dataset records the temperature "
@@ -174,6 +178,11 @@ class TimeLLM(nn.Module):
             nn.Linear(cfg.num_patches * cfg.d_llm, cfg.prediction_length),
         )
 
+        # 분류 head (use_cls_head=True 일 때만 생성)
+        # T-LLM과 동일한 stats-only head를 공유하여 공정 비교.
+        # RevIN 이전(x_raw)의 메모리 절대 수준 통계로 완료/중단을 분류한다.
+        self.cls_head = ClassificationHead(cfg.dropout) if cfg.use_cls_head else None
+
     # ------------------------------------------------------------------
     # Source embeddings via mapping_layer (Section 3.1)
     # ------------------------------------------------------------------
@@ -266,7 +275,28 @@ class TimeLLM(nn.Module):
         pred = pred.view(B, C, self.cfg.prediction_length).transpose(1, 2)
         return self.revin.denormalize(pred, mean, std)
 
+    # ------------------------------------------------------------------
+    # Classification (Trace 전용, use_cls_head=True)
+    # ------------------------------------------------------------------
+
+    def _cls_logit(self, x_raw: torch.Tensor) -> torch.Tensor:
+        """
+        x_raw: (B, L, C) — RevIN 이전 원시 입력.
+        T-LLM과 동일하게 x_norm(패턴) + x_raw(절대 수준) 통계로 logit 산출.
+        LLM forward와 완전히 독립 — regression gradient가 분류를 방해하지 않음.
+        """
+        x_norm, _, _ = self.revin.normalize(x_raw)
+        stats = ClassificationHead.compute_stats(x_norm, x_raw)  # (B, 8)
+        return self.cls_head(stats, x_raw[:, :, 0])              # (B,)
+
     @torch.no_grad()
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         self.eval()
         return self.forward(x)
+
+    @torch.no_grad()
+    def predict_cls(self, x: torch.Tensor) -> torch.Tensor:
+        """분류 logit 반환 (use_cls_head=True 전용). shape: (B,)"""
+        assert self.cls_head is not None, "use_cls_head=False 로 생성된 모델"
+        self.eval()
+        return self._cls_logit(x)
