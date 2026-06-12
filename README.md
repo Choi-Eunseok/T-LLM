@@ -22,13 +22,13 @@ PyTorch reimplementation of two LLM-based time series forecasting methods, evalu
 
 ### Google Cluster Trace — Memory Forecasting + Job Completion (Multi-task)
 
-| Model | Memory MSE ↓ | Completion ACC ↑ | Completion F1 ↑ | AUC ↑ |
-|-------|-------------|-----------------|----------------|-------|
-| **T-LLM** (ours) | **0.1713** | **0.712** | **0.752** | **0.797** |
-| **T-LLM + Noisy** (ours) | 0.1718 | 0.710 | 0.751 | 0.798 |
-| Time-LLM (ours) | 0.1733 | N/A¹ | N/A¹ | N/A¹ |
+| Model | Memory MSE ↓ | Memory MAE ↓ | Completion ACC ↑ | Completion F1 ↑ |
+|-------|-------------|-------------|-----------------|----------------|
+| T-LLM (ours) | 0.1707 | **0.0884** | **0.712** | **0.752** |
+| T-LLM + Noisy (ours) | 0.1718 | 0.0902 | 0.710 | 0.751 |
+| **Time-LLM** (ours) | **0.1630** | 0.0992 | 0.695 | 0.742 |
 
-> ¹ Time-LLM has no dedicated classification head. RevIN normalizes the constant label channel (0/1) to all-zeros, making the two classes indistinguishable at the input level.
+> All three models use the **same stats-based classification head** (337 params, computed from pre-RevIN memory statistics). The label channel (constant 0/1 per job) is destroyed by RevIN, so completion is predicted from raw memory level/trend statistics rather than the forecasting backbone. Classification scores are therefore similar across models; the meaningful comparison is **memory forecasting**, where Time-LLM wins on MSE and T-LLM on MAE.
 
 ### Training Efficiency (ETTh1, all 4 horizons combined)
 
@@ -39,6 +39,16 @@ PyTorch reimplementation of two LLM-based time series forecasting methods, evalu
 | Time-LLM | ~40.5 h | 950–1190 s | 17.9 ms/sample | 20.2 GB | 2.9 GB |
 
 T-LLM trains **55× faster** and runs inference **78× faster** than Time-LLM, using **8× less GPU memory**.
+
+### Training Efficiency (Google Cluster Trace, single run)
+
+| Model | Total Train Time | Per-epoch | Inference | GPU (train) | GPU (infer) |
+|-------|-----------------|-----------|-----------|-------------|-------------|
+| **T-LLM** | 45.7 min | 177 s | **0.22 ms/sample** | **1.7 GB** | **1.3 GB** |
+| **T-LLM + Noisy** | **44.6 min** | 173 s | 0.23 ms/sample | 1.7 GB | 1.3 GB |
+| Time-LLM | 113 min | 408 s | 0.71 ms/sample | 5.5 GB | 1.7 GB |
+
+On Trace, T-LLM trains **2.5× faster** and runs inference **3.2× faster** than Time-LLM, using **3.3× less GPU memory**.
 
 ---
 
@@ -73,6 +83,7 @@ Key components:
 - **Prompt-as-Prefix**: per-sample statistics (min/max/median/trend/top-5 lags) + dataset description
 - **Frozen GPT-2**: full 12-layer backbone, no gradient
 - **RevIN**: per-sample instance normalization
+- **ClassificationHead** (Trace only): same shared 337-param stats head as T-LLM, enabling an apples-to-apples completion-prediction comparison
 
 Trainable params: ~52–58M (mapping layer ~50M dominates)
 
@@ -241,7 +252,8 @@ seraph/                   SLURM job scripts for cluster execution
 
 ## Notes
 
-- **Noisy Teacher does not significantly improve T-LLM on Trace**: The classification head uses only `x_raw` statistics (pre-RevIN), which is completely decoupled from the teacher distillation path. Noise affects only the guidance loss (`L_guide`, λ=0.01), which contributes minimally to the total loss dominated by BCE (λ=5).
-- **Time-LLM cannot classify on Trace**: The label channel is constant (all 0s or all 1s per job). RevIN normalizes this to all-zeros regardless of the true label, so the model receives identical input for both classes.
+- **Classification is driven by raw statistics, not the LLM backbone**: All three models share the same 337-param stats head computed from pre-RevIN memory (`x_raw`). This head is fully decoupled from the forecasting path, so T-LLM, T-LLM+Noisy, and Time-LLM reach near-identical completion accuracy (0.71 / 0.71 / 0.69). The takeaway: **job completion is predictable from absolute memory level/trend, regardless of which forecasting model is attached.**
+- **Why the label channel needs a separate head**: The label is constant per job (all 0s or all 1s). RevIN normalizes this to all-zeros regardless of the true class, making the two classes indistinguishable if predicted as a forecasting channel. The stats head sidesteps this by reading `x_raw` directly.
+- **Noisy Teacher does not significantly improve T-LLM on Trace**: Noise affects only the guidance loss (`L_guide`, λ=0.01), which contributes minimally to the total loss dominated by BCE (λ=5), and the classification head is decoupled from the teacher path entirely.
 - **ETTh1 teacher overfitting**: Teacher val MSE consistently degrades after epoch 2–3 across all horizons. The student checkpoint is selected at this early point, limiting the benefit of longer training or noise strategies.
 - **val_mse vs test_mse gap on Trace** (0.022 vs 0.17): val jobs have narrower memory ranges; test metrics are the ground truth for paper reporting.
